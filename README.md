@@ -1,0 +1,1 @@
+this is the website helped for small kirana shop where they write all in book which is difficult. this helps for them by notifying out of stocks product, profit amount and which product is expired or getting expired 

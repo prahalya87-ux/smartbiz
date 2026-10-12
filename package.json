@@ -1,0 +1,12 @@
+{
+  "name": "smartbiz",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SmartBiz inventory & billing - full stack app (React client + Express API)",
+  "scripts": {
+    "dev": "node scripts/dev.js",
+    "build": "npm --prefix client run build",
+    "start": "node server/server.js",
+    "seed": "npm --prefix server run seed"
+  }
+}

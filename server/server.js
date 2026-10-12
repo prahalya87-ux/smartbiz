@@ -506,6 +506,67 @@ app.put('/api/notifications/:id/read', authenticate, wrap(async (req, res) => {
 }));
 // ================= END PHASE 3 =================
 
+// ---------- Dashboard (Admin / Manager) ----------
+app.get('/api/dashboard', authenticate, authorize(...MANAGERS), wrap(async (req, res) => {
+  const [[totals]] = await pool.query(
+    `SELECT COUNT(*) AS total_products,
+      COALESCE(SUM(current_stock), 0) AS total_units,
+      COALESCE(SUM(current_stock = 0), 0) AS out_of_stock
+     FROM products WHERE status = 'ACTIVE'`
+  );
+
+  // Sales vs purchases for the last 7 months (months with no data show as 0)
+  const [salesRows] = await pool.query(
+    `SELECT DATE_FORMAT(created_at, '%Y-%m') AS ym, SUM(final_amount) AS total
+     FROM sales
+     WHERE status <> 'RETURNED' AND created_at >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 6 MONTH), '%Y-%m-01')
+     GROUP BY ym`
+  );
+  const [purchaseRows] = await pool.query(
+    `SELECT DATE_FORMAT(purchase_date, '%Y-%m') AS ym, SUM(total_amount) AS total
+     FROM purchases
+     WHERE purchase_date >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 6 MONTH), '%Y-%m-01')
+     GROUP BY ym`
+  );
+  const salesBy = Object.fromEntries(salesRows.map((r) => [r.ym, Number(r.total)]));
+  const purchasesBy = Object.fromEntries(purchaseRows.map((r) => [r.ym, Number(r.total)]));
+  const months = [];
+  const now = new Date();
+  for (let i = 6; i >= 0; i -= 1) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    months.push({
+      month: d.toLocaleString('en-US', { month: 'short' }).toUpperCase(),
+      sales: salesBy[ym] || 0,
+      purchases: purchasesBy[ym] || 0,
+    });
+  }
+
+  const [brands] = await pool.query(
+    `SELECT COALESCE(NULLIF(p.brand, ''), 'Unbranded') AS brand, SUM(si.quantity - si.returned_quantity) AS qty
+     FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN products p ON p.id = si.product_id
+     WHERE s.status <> 'RETURNED'
+     GROUP BY brand HAVING qty > 0 ORDER BY qty DESC LIMIT 4`
+  );
+
+  const [lowStock] = await pool.query(
+    `SELECT id, sku, name, min_stock_level, current_stock FROM products
+     WHERE status = 'ACTIVE' AND current_stock <= min_stock_level
+     ORDER BY current_stock ASC, id ASC LIMIT 5`
+  );
+
+  const [topSelling] = await pool.query(
+    `SELECT p.id, p.name, p.selling_price, p.current_stock AS remaining_qty,
+       SUM(si.quantity - si.returned_quantity) AS sold_qty
+     FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN products p ON p.id = si.product_id
+     WHERE s.status <> 'RETURNED'
+     GROUP BY p.id, p.name, p.selling_price, p.current_stock HAVING sold_qty > 0
+     ORDER BY sold_qty DESC LIMIT 5`
+  );
+
+  res.json({ ...totals, months, brands, lowStock, topSelling });
+}));
+
 // ---------- Errors ----------
 app.use((req, res) => res.status(404).json({ message: 'Route not found.' }));
 // eslint-disable-next-line no-unused-vars
@@ -515,6 +576,170 @@ app.use((err, req, res, next) => {
     message: err.status ? err.message : 'Something went wrong. Please try again.',
   });
 });
+
+// ---------- Sample sales & purchase history (fixed numbers, nothing random) ----------
+// Units sold per month for each seeded product, scaled by the month factors below.
+const DEMO_MONTHLY_UNITS = {
+  'GRO-001': 14, 'GRO-002': 18, 'GRO-003': 20, 'GRO-004': 16, 'GRO-005': 30, 'GRO-006': 22,
+  'BEV-001': 60, 'BEV-002': 12, 'BEV-003': 90, 'BEV-004': 14, 'BEV-005': 40,
+  'PC-001': 16, 'PC-002': 24, 'PC-003': 50, 'PC-004': 8, 'PC-005': 10,
+  'HOU-001': 18, 'HOU-002': 12, 'HOU-003': 16, 'HOU-004': 14, 'HOU-005': 8,
+  'STA-001': 40, 'STA-002': 120, 'STA-003': 26, 'STA-004': 8,
+};
+// Oldest month -> this month. Same bar shape as the dashboard design.
+const DEMO_SALES_FACTOR = [1.0, 1.18, 0.92, 0.97, 0.97, 0.92, 1.05];
+const DEMO_PURCHASE_RATIO = [0.37, 0.82, 1.05, 0.38, 0.73, 0.51, 0.3]; // purchases as a share of that month's sales
+const r2 = (n) => Math.round(n * 100) / 100;
+const pad2 = (n) => String(n).padStart(2, '0');
+const fmtTs = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:00`;
+
+// products: { sku: { id, purchase_price, selling_price, tax_percentage, supplier_id } }
+function buildDemoHistory(products, now) {
+  const skus = Object.keys(DEMO_MONTHLY_UNITS).filter((s) => products[s]);
+  let events = [];
+  for (let m = 0; m < 7; m += 1) {
+    const first = new Date(now.getFullYear(), now.getMonth() - (6 - m), 1);
+    const lastDay = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
+    const days = m === 6 ? now.getDate() : Math.min(28, lastDay); // never date a sale in the future
+    const when = (day, h, min) => {
+      const d = new Date(first.getFullYear(), first.getMonth(), Math.min(day, days), h, min);
+      return d > now ? new Date(now.getTime() - 60000) : d;
+    };
+
+    // ----- sales: split each product's monthly units into bills of up to 12 units, 3 products per bill -----
+    const chunks = [];
+    const soldQty = {};
+    skus.forEach((sku, idx) => {
+      const wobble = 1 + (((idx * 3 + m * 5) % 7) - 3) / 30; // small fixed variation per product
+      const qty = Math.max(1, Math.round(DEMO_MONTHLY_UNITS[sku] * DEMO_SALES_FACTOR[m] * wobble));
+      soldQty[sku] = qty;
+      for (let left = qty; left > 0; left -= 12) chunks.push({ sku, qty: Math.min(12, left) });
+    });
+    const bills = Math.ceil(chunks.length / 3);
+    for (let j = 0; j < bills; j += 1) {
+      const lines = {};
+      chunks.forEach((c, i) => { if (i % bills === j) lines[c.sku] = (lines[c.sku] || 0) + c.qty; });
+      events.push({
+        kind: 'sale', ts: when(1 + ((j * 7 + m * 3) % days), 9 + ((j * 5) % 11), (j * 13) % 60),
+        lines: Object.entries(lines).map(([sku, qty]) => ({ sku, qty })),
+      });
+    }
+
+    // ----- purchases: one restock per supplier, sized as a share of this month's sales -----
+    const bySupplier = {};
+    skus.forEach((sku) => {
+      const p = products[sku];
+      if (!p.supplier_id) return;
+      const qty = Math.round(soldQty[sku] * DEMO_PURCHASE_RATIO[m] * Math.min(p.selling_price / p.purchase_price, 1.4));
+      if (qty > 0) (bySupplier[p.supplier_id] = bySupplier[p.supplier_id] || []).push({ sku, qty });
+    });
+    Object.keys(bySupplier).map(Number).sort((a, b) => a - b).forEach((sid, k) => {
+      events.push({ kind: 'purchase', supplierId: sid, ts: when(2 + k * 4, 8, 30), lines: bySupplier[sid] });
+    });
+  }
+
+  events.sort((a, b) => a.ts - b.ts || (a.kind === 'purchase' ? -1 : 1) - (b.kind === 'purchase' ? -1 : 1));
+
+  // Walk backwards from today's real stock so stock never goes below zero at any point in the history:
+  // a restock can't be bigger than the stock that existed right after it.
+  const state = {};
+  skus.forEach((sku) => { state[sku] = products[sku].current_stock; });
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const e = events[i];
+    e.lines.forEach((l) => {
+      if (e.kind === 'sale') { state[l.sku] += l.qty; } else { l.qty = Math.min(l.qty, state[l.sku]); state[l.sku] -= l.qty; }
+    });
+    if (e.kind === 'purchase') e.lines = e.lines.filter((l) => l.qty > 0);
+  }
+  events = events.filter((e) => e.lines.length > 0);
+  let s = 0; let p = 0;
+  const net = {}; // units sold minus units bought, per product (used to keep today's stock unchanged)
+  events.forEach((e) => {
+    if (e.kind === 'sale') { s += 1; e.invoice = `INV-DEMO-${String(s).padStart(4, '0')}`; } else { p += 1; e.invoice = `PUR-DEMO-${String(p).padStart(3, '0')}`; }
+    let subtotal = 0; let tax = 0;
+    e.lines.forEach((l) => {
+      const pr = products[l.sku];
+      l.price = e.kind === 'sale' ? pr.selling_price : pr.purchase_price;
+      l.total = r2(l.qty * l.price);
+      subtotal += l.total;
+      tax += r2((l.total * pr.tax_percentage) / 100);
+      net[l.sku] = (net[l.sku] || 0) + (e.kind === 'sale' ? l.qty : -l.qty);
+    });
+    e.subtotal = r2(subtotal); e.tax = r2(tax); e.total = r2(subtotal + tax);
+  });
+  return { events, net };
+}
+
+async function seedDemoHistory(adminId, cashierId) {
+  const [[{ n }]] = await pool.query("SELECT COUNT(*) AS n FROM sales WHERE invoice_number LIKE 'INV-DEMO-%'");
+  if (n > 0) {
+    console.log('Sample sales history already in the database - skipped');
+    return;
+  }
+  const [rows] = await pool.query(
+    'SELECT id, sku, purchase_price, selling_price, tax_percentage, supplier_id, current_stock FROM products'
+  );
+  const products = Object.fromEntries(rows.map((r) => [r.sku, {
+    id: r.id, supplier_id: r.supplier_id, current_stock: r.current_stock,
+    purchase_price: Number(r.purchase_price), selling_price: Number(r.selling_price), tax_percentage: Number(r.tax_percentage),
+  }]));
+  const { events, net } = buildDemoHistory(products, new Date());
+  if (events.length === 0) return;
+
+  // Today's stock stays exactly as seeded: add the units that the history will sell (minus restocks) back
+  // as opening stock, dated before the first sale. Opening-stock rows are moved back in time too.
+  const openAt = fmtTs(new Date(events[0].ts.getTime() - 86400000));
+  for (const [sku, change] of Object.entries(net)) {
+    const pr = products[sku];
+    await withTransaction(async (conn) => {
+      await conn.query("UPDATE stock_transactions SET created_at = ? WHERE product_id = ? AND note = 'Opening stock'", [openAt, pr.id]);
+      if (change !== 0) {
+        await changeStock(conn, pr.id, change, change > 0 ? 'PURCHASE' : 'MANUAL_ADJUSTMENT', adminId, 'Opening stock (before sales history)');
+        await conn.query('UPDATE stock_transactions SET created_at = ? WHERE product_id = ? AND reference_type IS NULL AND note = ?',
+          [openAt, pr.id, 'Opening stock (before sales history)']);
+      }
+    });
+  }
+
+  const SALE_METHODS = ['CASH', 'UPI', 'CARD', 'CASH', 'UPI'];
+  let saleNo = 0;
+  for (const e of events) {
+    const ts = fmtTs(e.ts);
+    await withTransaction(async (conn) => {
+      if (e.kind === 'sale') {
+        const method = SALE_METHODS[saleNo % SALE_METHODS.length];
+        saleNo += 1;
+        const [r] = await conn.query(
+          `INSERT INTO sales (invoice_number, customer_id, cashier_id, subtotal, tax_amount, discount, final_amount, amount_paid,
+             payment_method, payment_status, status, created_at) VALUES (?,NULL,?,?,?,0,?,?,?,'PAID','COMPLETED',?)`,
+          [e.invoice, cashierId, e.subtotal, e.tax, e.total, e.total, method, ts]
+        );
+        await conn.query(
+          'INSERT INTO sale_items (sale_id, product_id, quantity, unit_price, cost_price, tax_percentage, line_total) VALUES ?',
+          [e.lines.map((l) => [r.insertId, products[l.sku].id, l.qty, l.price, products[l.sku].purchase_price, products[l.sku].tax_percentage, l.total])]
+        );
+        for (const l of e.lines) await changeStock(conn, products[l.sku].id, -l.qty, 'SALE', cashierId, `Sale ${e.invoice}`, 'sale', r.insertId);
+        await conn.query('INSERT INTO payments (sale_id, amount, method, paid_at) VALUES (?,?,?,?)', [r.insertId, e.total, method, ts]);
+        await conn.query("UPDATE stock_transactions SET created_at = ? WHERE reference_type = 'sale' AND reference_id = ?", [ts, r.insertId]);
+      } else {
+        const [r] = await conn.query(
+          `INSERT INTO purchases (invoice_number, supplier_id, created_by, purchase_date, subtotal, tax_amount, discount, total_amount,
+             amount_paid, payment_status, notes, created_at) VALUES (?,?,?,?,?,?,0,?,?,'PAID','Sample restock',?)`,
+          [e.invoice, e.supplierId, adminId, ts.slice(0, 10), e.subtotal, e.tax, e.total, e.total, ts]
+        );
+        await conn.query(
+          'INSERT INTO purchase_items (purchase_id, product_id, quantity, unit_price, tax_percentage, line_total) VALUES ?',
+          [e.lines.map((l) => [r.insertId, products[l.sku].id, l.qty, l.price, products[l.sku].tax_percentage, l.total])]
+        );
+        for (const l of e.lines) await changeStock(conn, products[l.sku].id, l.qty, 'PURCHASE', adminId, `Purchase ${e.invoice}`, 'purchase', r.insertId);
+        await conn.query("INSERT INTO payments (purchase_id, amount, method, paid_at) VALUES (?,?,'OTHER',?)", [r.insertId, e.total, ts]);
+        await conn.query("UPDATE stock_transactions SET created_at = ? WHERE reference_type = 'purchase' AND reference_id = ?", [ts, r.insertId]);
+      }
+    });
+  }
+  const sales = events.filter((e) => e.kind === 'sale').length;
+  console.log(`Seeded sample history: ${sales} sales and ${events.length - sales} purchases over the last 7 months`);
+}
 
 // ---------- Seed command: npm run seed ----------
 async function seed() {
@@ -601,8 +826,62 @@ async function seed() {
          VALUES (?,?,?,?,?,?,?,?,?,0,?,?,${expiry})`, args);
       if (r.affectedRows === 1 && stock > 0) await changeStock(pool, r.insertId, stock, 'PURCHASE', admin.id, 'Opening stock');
     }
+    const [[cashier]] = await pool.query("SELECT id FROM users WHERE email = 'cashier@smartbiz.com'");
+    await seedDemoHistory(admin.id, cashier.id);
     await syncAlerts();
     console.log('Seeded 5 categories, 5 suppliers, 25 products and alerts');
+
+    // ----- Demo sales across the last 7 months (runs once, so charts have data) -----
+    const [[{ saleCount }]] = await pool.query('SELECT COUNT(*) AS saleCount FROM sales');
+    if (saleCount === 0) {
+      const [[cashier]] = await pool.query("SELECT id FROM users WHERE email = 'cashier@smartbiz.com'");
+      const [prodRows] = await pool.query(
+        "SELECT id, selling_price, purchase_price, tax_percentage FROM products WHERE status = 'ACTIVE'");
+      const methods = ['CASH', 'CARD', 'UPI'];
+      const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+      const now = new Date();
+      let inv = 1000;
+      let made = 0;
+      for (let m = 6; m >= 0; m -= 1) {
+        const base = new Date(now.getFullYear(), now.getMonth() - m, 1);
+        const daysInMonth = new Date(base.getFullYear(), base.getMonth() + 1, 0).getDate();
+        const lastDay = m === 0 ? now.getDate() : daysInMonth; // current month: nothing in the future
+        const salesCount = Math.max(Math.round((lastDay / daysInMonth) * 14), 4);
+        for (let s = 0; s < salesCount; s += 1) {
+          const day = Math.max(1, Math.round(((s + 0.5) / salesCount) * lastDay));
+          const when = new Date(base.getFullYear(), base.getMonth(), day, rand(9, 20), rand(0, 59), rand(0, 59));
+          if (when > now) continue;
+          const itemCount = rand(1, 4);
+          let subtotal = 0;
+          let taxAmount = 0;
+          const items = [];
+          for (let i = 0; i < itemCount; i += 1) {
+            const p = prodRows[rand(0, prodRows.length - 1)];
+            const qty = rand(1, 4);
+            const line = qty * p.selling_price;
+            const tax = (line * p.tax_percentage) / 100;
+            items.push({ id: p.id, qty, unit: p.selling_price, cost: p.purchase_price, taxPct: p.tax_percentage, line, tax });
+            subtotal += line;
+            taxAmount += tax;
+          }
+          const final = subtotal + taxAmount;
+          inv += 1;
+          made += 1;
+          const [saleRes] = await pool.query(
+            `INSERT INTO sales (invoice_number, cashier_id, subtotal, tax_amount, discount, final_amount,
+               amount_paid, payment_method, payment_status, status, created_at)
+             VALUES (?,?,?,?,0,?,?,?,'PAID','COMPLETED',?)`,
+            [`INV-${String(inv).padStart(5, '0')}`, cashier.id, subtotal, taxAmount, final, final, methods[rand(0, 2)], when]);
+          for (const it of items) {
+            await pool.query(
+              `INSERT INTO sale_items (sale_id, product_id, quantity, unit_price, cost_price, tax_percentage, line_total)
+               VALUES (?,?,?,?,?,?,?)`,
+              [saleRes.insertId, it.id, it.qty, it.unit, it.cost, it.taxPct, it.line]);
+          }
+        }
+      }
+      console.log(`Seeded ${made} demo sales across the last 7 months`);
+    }
   } catch (err) {
     console.error('Seed failed:', err.message);
   } finally {

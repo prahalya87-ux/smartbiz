@@ -2,6 +2,8 @@ import React, { createContext, useCallback, useContext, useEffect, useState } fr
 import ReactDOM from 'react-dom/client';
 import { BrowserRouter, Link, Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import axios from 'axios';
+import { Bar, Pie } from 'react-chartjs-2';
+import { ArcElement, BarElement, CategoryScale, Chart as ChartJS, Legend, LinearScale, Tooltip } from 'chart.js';
 import { ToastContainer, toast } from 'react-toastify';
 import 'bootstrap/dist/css/bootstrap.min.css';
 import 'bootstrap-icons/font/bootstrap-icons.css';
@@ -404,7 +406,7 @@ function StatCard({ label, value, icon, color = 'primary' }) {
   );
 }
 
-function Dashboard() {
+function BasicDashboard() {
   const inv = useApi('/inventory');
   const notes = useApi('/notifications');
   const s = inv.data;
@@ -438,6 +440,173 @@ function Dashboard() {
       </div>
     </>
   );
+}
+
+// ---------- Analytics dashboard (Admin / Manager) ----------
+ChartJS.register(CategoryScale, LinearScale, BarElement, ArcElement, Tooltip, Legend);
+
+const BRAND_COLORS = ['#1e3a8a', '#10b981', '#8b5e3c', '#f97316', '#94a3b8'];
+const shortMoney = (n) => (n >= 100000 ? `${(n / 100000).toFixed(1)}L` : n >= 1000 ? `${(n / 1000).toFixed(0)}k` : String(n));
+
+function KpiCard({ label, value, icon, bg, to }) {
+  return (
+    <div className="col-12 col-md-4">
+      <div className="card h-100 p-3 border-0 shadow-sm">
+        <div className="d-flex justify-content-between align-items-start">
+          <span className="d-inline-flex align-items-center justify-content-center rounded-3 text-white" style={{ width: 42, height: 42, background: bg }}>
+            <i className={`bi bi-${icon} fs-5`} aria-hidden="true"></i>
+          </span>
+          <Link to={to} className="btn btn-primary rounded-circle d-inline-flex align-items-center justify-content-center p-0" style={{ width: 26, height: 26 }} aria-label={`Open ${label}`}>
+            <i className="bi bi-chevron-right small" aria-hidden="true"></i>
+          </Link>
+        </div>
+        <div className="text-secondary text-uppercase mt-3" style={{ fontSize: 12, letterSpacing: '.03em' }}>{label}</div>
+        <div className="fs-4 fw-semibold">{Number(value || 0).toLocaleString('en-IN')}</div>
+      </div>
+    </div>
+  );
+}
+
+function AnalyticsDashboard() {
+  const { user } = useAuth();
+  const dash = useApi('/dashboard');
+  const d = dash.data;
+
+  const barData = d && {
+    labels: d.months.map((m) => m.month),
+    datasets: [
+      { label: 'Sales', data: d.months.map((m) => m.sales), backgroundColor: '#4f7cf0', borderRadius: 4 },
+      { label: 'Purchase', data: d.months.map((m) => m.purchases), backgroundColor: '#c9d6fb', borderRadius: 4 },
+    ],
+  };
+  const barOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: { legend: { position: 'top', align: 'start', labels: { usePointStyle: true, boxWidth: 8 } }, tooltip: { callbacks: { label: (c) => `${c.dataset.label}: ${money(c.parsed.y)}` } } },
+    scales: { y: { beginAtZero: true, ticks: { callback: (v) => shortMoney(v) }, grid: { color: '#eef1f6' } }, x: { grid: { display: false } } },
+  };
+
+  const brandTotal = d ? d.brands.reduce((sum, b) => sum + Number(b.qty), 0) : 0;
+  const pieData = d && {
+    labels: d.brands.map((b) => b.brand),
+    datasets: [{ data: d.brands.map((b) => Number(b.qty)), backgroundColor: BRAND_COLORS, borderWidth: 2, borderColor: '#fff' }],
+  };
+
+  return (
+    <>
+      <div className="mb-3">
+        <h1 className="h4 mb-0">Hello, {user.name}</h1>
+        <div className="text-secondary small">{new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}</div>
+      </div>
+
+      <DataState state={dash}>
+        {d && (
+          <>
+            <div className="row g-3 mb-3">
+              <KpiCard label="Total products in inventory" value={d.total_products} icon="box-seam" bg="#198754" to="/products" />
+              <KpiCard label="Total quantity on hand" value={d.total_units} icon="stack" bg="#fd7e14" to="/inventory" />
+              <KpiCard label="Out of stock products" value={d.out_of_stock} icon="x-octagon" bg="#dc3545" to="/inventory" />
+            </div>
+
+            <div className="row g-3 mb-3">
+              <div className="col-lg-8">
+                <div className="card border-0 shadow-sm h-100 p-3">
+                  <div className="fw-semibold mb-2">Sales &amp; Purchase <span className="text-secondary small fw-normal">(last 7 months)</span></div>
+                  <div style={{ height: 260 }}><Bar data={barData} options={barOptions} /></div>
+                </div>
+              </div>
+              <div className="col-lg-4">
+                <div className="card border-0 shadow-sm h-100 p-3">
+                  <div className="fw-semibold mb-2">Top Selling Brands</div>
+                  {d.brands.length === 0 ? (
+                    <Empty text="No sales yet." />
+                  ) : (
+                    <>
+                      <div style={{ height: 190 }}>
+                        <Pie data={pieData} options={{ responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }} />
+                      </div>
+                      <ul className="list-unstyled small mb-0 mt-3 d-flex flex-wrap gap-3 justify-content-center">
+                        {d.brands.map((b, i) => (
+                          <li key={b.brand}>
+                            <span className="d-inline-block rounded-circle me-1" style={{ width: 9, height: 9, background: BRAND_COLORS[i] }}></span>
+                            {b.brand} ({Math.round((Number(b.qty) / brandTotal) * 100)}%)
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="row g-3">
+              <div className="col-lg-6">
+                <div className="card border-0 shadow-sm h-100">
+                  <div className="d-flex justify-content-between align-items-center p-3 pb-2">
+                    <span className="fw-semibold">Low Stock Alert</span>
+                    <Link to="/inventory" className="small">View all</Link>
+                  </div>
+                  {d.lowStock.length === 0 ? (
+                    <Empty text="All products are well stocked." />
+                  ) : (
+                    <div className="table-responsive">
+                      <table className="table table-sm align-middle mb-0">
+                        <thead className="text-secondary small"><tr><th className="ps-3">Product ID</th><th>Name</th><th>Min. qty</th><th className="pe-3">Alert qty</th></tr></thead>
+                        <tbody>
+                          {d.lowStock.map((p) => (
+                            <tr key={p.id}>
+                              <td className="ps-3">{p.sku}</td>
+                              <td>{p.name}</td>
+                              <td>{p.min_stock_level}</td>
+                              <td className="pe-3 fw-semibold text-danger">{p.current_stock}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="col-lg-6">
+                <div className="card border-0 shadow-sm h-100">
+                  <div className="d-flex justify-content-between align-items-center p-3 pb-2">
+                    <span className="fw-semibold">Top Selling List</span>
+                    <Link to="/products" className="small">View all</Link>
+                  </div>
+                  {d.topSelling.length === 0 ? (
+                    <Empty text="No sales yet." />
+                  ) : (
+                    <div className="table-responsive">
+                      <table className="table table-sm align-middle mb-0">
+                        <thead className="text-secondary small"><tr><th className="ps-3">Name</th><th>Sold qty</th><th>Remaining qty</th><th className="pe-3">Price</th></tr></thead>
+                        <tbody>
+                          {d.topSelling.map((p) => (
+                            <tr key={p.id}>
+                              <td className="ps-3">{p.name}</td>
+                              <td>{p.sold_qty}</td>
+                              <td>{p.remaining_qty}</td>
+                              <td className="pe-3">{money(p.selling_price)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+      </DataState>
+    </>
+  );
+}
+
+// Admin and Manager get the analytics view; Cashier and Staff keep the simple one
+function Dashboard() {
+  const { user } = useAuth();
+  return MANAGERS.includes(user.role) ? <AnalyticsDashboard /> : <BasicDashboard />;
 }
 
 // ---------- Generic list + add/edit/delete page (used by Categories and Suppliers) ----------

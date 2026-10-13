@@ -90,6 +90,7 @@ const loginLimiter = rateLimit({
 
 // ---------- App ----------
 const app = express();
+app.set('trust proxy', 1);
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
 // Allow the configured client, plus any localhost port while developing

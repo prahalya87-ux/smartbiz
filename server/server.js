@@ -14,14 +14,17 @@ const fs = require('fs');
 // ---------- Database ----------
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
+  port: Number(process.env.DB_PORT || 3306),
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
+  ssl: {
+    rejectUnauthorized: true
+  },
   waitForConnections: true,
-  dateStrings: true, // dates come back as plain text like 2026-10-02
+  dateStrings: true,
   connectionLimit: 10,
 });
-
 // ---------- Helpers ----------
 const logAction = async (userId, action, entity, entityId, details, ip) => {
   try {

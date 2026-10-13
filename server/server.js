@@ -93,18 +93,11 @@ const app = express();
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
 // Allow the configured client, plus any localhost port while developing
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      const ok =
-        !origin ||
-        origin === process.env.CLIENT_URL ||
-        /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
-      cb(null, ok);
-    },
-    credentials: true,
-  })
-);
+app.use(cors({
+    origin: 'https://smartbiz-management-system.netlify.app',
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
 app.use(express.json({ limit: '1mb' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));

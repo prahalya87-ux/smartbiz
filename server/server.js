@@ -12,8 +12,7 @@ const multer = require('multer');
 const fs = require('fs');
 
 // ---------- Database ----------
-const fs = require('fs');
-const mysql = require('mysql2/promise');
+
 
 const pool = mysql.createPool({
   host: process.env.DB_HOST,

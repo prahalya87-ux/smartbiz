@@ -4,7 +4,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const mysql = require('mysql2/promise');
+const { DatabaseSync } = require('node:sqlite');
 const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
 const path = require('path');
@@ -12,22 +12,98 @@ const multer = require('multer');
 const fs = require('fs');
 
 // ---------- Database ----------
+// The app now runs on an embedded SQLite database (node:sqlite, no external
+// server needed), so "server unavailable" can no longer come from a remote
+// MySQL host being down. The rest of this file keeps the mysql2 pool API
+// shape:  const [rows] = await pool.query(sql, params)
 
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'smartbiz.db');
+const db = new DatabaseSync(DB_PATH);
+db.exec(fs.readFileSync(path.join(__dirname, 'schema.sqlite.sql'), 'utf8'));
 
-const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  port: Number(process.env.DB_PORT || 28876),
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  ssl: {
-    ca: fs.readFileSync(require('path').join(__dirname, 'ca.pem'), 'utf8'),
-    rejectUnauthorized: true,
+if (process.env.NODE_ENV === 'development') {
+  const demoUsers = [
+    ['Admin User', 'admin@smartbiz.com', 'Admin@123', 'ADMIN'],
+    ['Manager User', 'manager@smartbiz.com', 'Manager@123', 'MANAGER'],
+    ['Cashier User', 'cashier@smartbiz.com', 'Cashier@123', 'CASHIER'],
+    ['Staff User', 'staff@smartbiz.com', 'Staff@123', 'STAFF'],
+  ];
+  const findUser = db.prepare('SELECT 1 FROM users WHERE email = ?');
+  const findRole = db.prepare('SELECT id FROM roles WHERE name = ?');
+  const insertUser = db.prepare('INSERT INTO users (name, email, password_hash, role_id) VALUES (?,?,?,?)');
+  for (const [name, email, password, role] of demoUsers) {
+    if (findUser.get(email)) continue;
+    const roleRow = findRole.get(role);
+    if (roleRow) insertUser.run(name, email, bcrypt.hashSync(password, 10), roleRow.id);
+  }
+}
+
+// Rewrites mysql2 conveniences into plain SQLite:
+//  - array params inside IN (?) are expanded to IN (?,?...)
+//  - bulk "VALUES ?" with rows of arrays becomes VALUES (...),(...)
+//  - booleans / undefined / Date objects become SQLite-friendly values
+const expandPlaceholders = (sql, params) => {
+  let out = '';
+  let rest = sql;
+  const flat = [];
+  for (const p of params) {
+    const idx = rest.indexOf('?');
+    if (idx === -1) break;
+    if (Array.isArray(p)) {
+      if (rest.slice(Math.max(0, idx - 4), idx).toUpperCase().endsWith('IN (') && rest[idx + 1] === ')') {
+        out += rest.slice(0, idx) + (p.length ? p.map(() => '?').join(',') : 'NULL');
+        flat.push(...p);
+      } else { // bulk rows: "VALUES ?"
+        const width = p[0] ? p[0].length : 1;
+        out += rest.slice(0, idx) + p.map(() => `(${Array(width).fill('?').join(',')})`).join(',');
+        for (const row of p) flat.push(...row);
+      }
+    } else {
+      out += rest.slice(0, idx) + '?';
+      flat.push(p);
+    }
+    rest = rest.slice(idx + 1);
+  }
+  return [out + rest, flat.map((v) => {
+    if (v === undefined) return null;
+    if (typeof v === 'boolean') return v ? 1 : 0;
+    if (v instanceof Date) return fmtTs(v);
+    return v;
+  })];
+};
+
+const runQuery = (sql, params = []) => {
+  const [finalSql, flat] = expandPlaceholders(sql, params);
+  try {
+    const stmt = db.prepare(finalSql);
+    if (/^\s*(SELECT|WITH|PRAGMA)\b/i.test(finalSql)) return [stmt.all(...flat), undefined];
+    const info = stmt.run(...flat);
+    return [{ insertId: Number(info.lastInsertRowid), affectedRows: Number(info.changes) }, undefined];
+  } catch (err) {
+    const code = err.errcode;
+    if (code === 2067 || code === 1555) err.code = 'ER_DUP_ENTRY'; // UNIQUE constraint
+    else if (code === 787) { // FOREIGN KEY constraint
+      err.code = /^\s*DELETE\b/i.test(finalSql) ? 'ER_ROW_IS_REFERENCED_2' : 'ER_NO_REFERENCED_ROW_2';
+    }
+    err.sqlMessage = err.message;
+    throw err;
+  }
+};
+
+const pool = {
+  query: async (sql, params) => runQuery(sql, params || []),
+  getConnection: async () => {
+    let inTx = false;
+    return {
+      query: async (sql, params) => runQuery(sql, params || []),
+      beginTransaction: async () => { db.exec('BEGIN'); inTx = true; },
+      commit: async () => { db.exec('COMMIT'); inTx = false; },
+      rollback: async () => { if (inTx) db.exec('ROLLBACK'); inTx = false; },
+      release: async () => {},
+    };
   },
-  waitForConnections: true,
-  dateStrings: true,
-  connectionLimit: 10,
-});
+  end: async () => {},
+};
 // ---------- Helpers ----------
 const logAction = async (userId, action, entity, entityId, details, ip) => {
   try {
@@ -93,11 +169,24 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
-// Allow the configured client, plus any localhost port while developing
+// Allow the deployed client and localhost ports while developing.
+const allowedOrigins = new Set([
+  'https://smartbiz-management-system.netlify.app',
+  process.env.CLIENT_ORIGIN,
+].filter(Boolean));
 app.use(cors({
-    origin: 'https://smartbiz-management-system.netlify.app',
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+    try {
+      const hostname = new URL(origin).hostname;
+      if (hostname === 'localhost' || hostname === '127.0.0.1') return callback(null, true);
+    } catch (_) {
+      return callback(null, false);
+    }
+    return callback(null, false);
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
 app.use(express.json({ limit: '1mb' }));
@@ -203,7 +292,7 @@ async function withTransaction(fn) {
 
 // EVERY stock change goes through here: updates stock, blocks negatives, records a transaction
 async function changeStock(conn, productId, change, type, userId, note, refType = null, refId = null) {
-  const [[p]] = await conn.query('SELECT current_stock FROM products WHERE id = ? FOR UPDATE', [productId]);
+  const [[p]] = await conn.query('SELECT current_stock FROM products WHERE id = ?', [productId]);
   if (!p) throw httpError(400, 'Invalid product ID.');
   const after = p.current_stock + change;
   if (after < 0) throw httpError(400, 'Quantity cannot be greater than available stock.');
@@ -219,7 +308,8 @@ async function changeStock(conn, productId, change, type, userId, note, refType 
 // Creates alerts for low/out of stock and expiry, and clears ones that no longer apply
 async function syncAlerts() {
   const [rows] = await pool.query(
-    `SELECT id, name, current_stock, min_stock_level, DATEDIFF(expiry_date, CURDATE()) AS days_left
+     `SELECT id, name, current_stock, min_stock_level,
+       CAST(julianday(expiry_date) - julianday(date('now','localtime')) AS INTEGER) AS days_left
      FROM products WHERE status = 'ACTIVE'`
   );
   for (const p of rows) {
@@ -324,7 +414,7 @@ mountCrud('suppliers', 'suppliers',
 
 // ---------- Products ----------
 const PRODUCT_SELECT = `SELECT p.*, c.name AS category_name, s.name AS supplier_name,
-  DATEDIFF(p.expiry_date, CURDATE()) AS days_left
+  CAST(julianday(p.expiry_date) - julianday(date('now','localtime')) AS INTEGER) AS days_left
   FROM products p JOIN categories c ON c.id = p.category_id LEFT JOIN suppliers s ON s.id = p.supplier_id`;
 
 const productRules = [
@@ -354,7 +444,7 @@ app.get('/api/products', authenticate, wrap(async (req, res) => {
   if (status) { where.push('p.status = ?'); args.push(status); }
   if (alert === 'low') where.push('(p.current_stock > 0 AND p.current_stock <= p.min_stock_level)');
   if (alert === 'out') where.push('p.current_stock = 0');
-  if (alert === 'expiring') where.push('(p.expiry_date IS NOT NULL AND p.expiry_date <= DATE_ADD(CURDATE(), INTERVAL 30 DAY))');
+  if (alert === 'expiring') where.push("(p.expiry_date IS NOT NULL AND p.expiry_date <= date('now','localtime','+30 days'))");
   const sortCols = { name: 'p.name', price: 'p.selling_price', stock: 'p.current_stock', expiry: 'p.expiry_date', created: 'p.created_at' };
   const orderBy = `${sortCols[sort] || 'p.name'} ${dir === 'desc' ? 'DESC' : 'ASC'}`;
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
@@ -372,7 +462,7 @@ app.get('/api/products/low-stock', authenticate, wrap(async (req, res) => {
 app.get('/api/products/expiring', authenticate, wrap(async (req, res) => {
   const [rows] = await pool.query(
     `${PRODUCT_SELECT} WHERE p.status = 'ACTIVE' AND p.expiry_date IS NOT NULL
-     AND p.expiry_date <= DATE_ADD(CURDATE(), INTERVAL 30 DAY) ORDER BY p.expiry_date`);
+    AND p.expiry_date <= date('now','localtime','+30 days') ORDER BY p.expiry_date`);
   res.json(rows);
 }));
 
@@ -446,8 +536,8 @@ app.get('/api/inventory', authenticate, wrap(async (req, res) => {
       COALESCE(SUM(current_stock * selling_price), 0) AS retail_value,
       COALESCE(SUM(current_stock > 0 AND current_stock <= min_stock_level), 0) AS low_stock,
       COALESCE(SUM(current_stock = 0), 0) AS out_of_stock,
-      COALESCE(SUM(expiry_date IS NOT NULL AND expiry_date >= CURDATE() AND expiry_date <= DATE_ADD(CURDATE(), INTERVAL 30 DAY)), 0) AS expiring,
-      COALESCE(SUM(expiry_date IS NOT NULL AND expiry_date < CURDATE()), 0) AS expired
+      COALESCE(SUM(expiry_date IS NOT NULL AND expiry_date >= date('now','localtime') AND expiry_date <= date('now','localtime','+30 days')), 0) AS expiring,
+      COALESCE(SUM(expiry_date IS NOT NULL AND expiry_date < date('now','localtime')), 0) AS expired
      FROM products WHERE status = 'ACTIVE'`
   );
   res.json(s);
@@ -517,15 +607,15 @@ app.get('/api/dashboard', authenticate, authorize(...MANAGERS), wrap(async (req,
 
   // Sales vs purchases for the last 7 months (months with no data show as 0)
   const [salesRows] = await pool.query(
-    `SELECT DATE_FORMAT(created_at, '%Y-%m') AS ym, SUM(final_amount) AS total
+    `SELECT strftime('%Y-%m', created_at) AS ym, SUM(final_amount) AS total
      FROM sales
-     WHERE status <> 'RETURNED' AND created_at >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 6 MONTH), '%Y-%m-01')
+     WHERE status <> 'RETURNED' AND created_at >= date('now','localtime','start of month','-6 months')
      GROUP BY ym`
   );
   const [purchaseRows] = await pool.query(
-    `SELECT DATE_FORMAT(purchase_date, '%Y-%m') AS ym, SUM(total_amount) AS total
+    `SELECT strftime('%Y-%m', purchase_date) AS ym, SUM(total_amount) AS total
      FROM purchases
-     WHERE purchase_date >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 6 MONTH), '%Y-%m-01')
+     WHERE purchase_date >= date('now','localtime','start of month','-6 months')
      GROUP BY ym`
   );
   const salesBy = Object.fromEntries(salesRows.map((r) => [r.ym, Number(r.total)]));
@@ -759,8 +849,7 @@ async function seed() {
       const [[role]] = await pool.query('SELECT id FROM roles WHERE name = ?', [u.role]);
       const hash = await bcrypt.hash(u.password, 10);
       await pool.query(
-        `INSERT INTO users (name, email, password_hash, role_id) VALUES (?,?,?,?)
-         ON DUPLICATE KEY UPDATE name = VALUES(name), password_hash = VALUES(password_hash), role_id = VALUES(role_id)`,
+        'INSERT OR IGNORE INTO users (name, email, password_hash, role_id) VALUES (?,?,?,?)',
         [u.name, u.email, hash, role.id]
       );
       console.log(`Seeded ${u.role}: ${u.email}`);
@@ -768,7 +857,7 @@ async function seed() {
 
     // ----- Phase 3 seed: categories, suppliers, products (safe to run more than once) -----
     const cats = ['Groceries', 'Beverages', 'Personal Care', 'Household', 'Stationery'];
-    for (const c of cats) await pool.query('INSERT IGNORE INTO categories (name) VALUES (?)', [c]);
+    for (const c of cats) await pool.query('INSERT OR IGNORE INTO categories (name) VALUES (?)', [c]);
 
     const sups = [
       ['Fresh Farms Traders', 'Fresh Farms Pvt Ltd', '9876500001', 'sales@freshfarms.example'],
@@ -778,7 +867,7 @@ async function seed() {
       ['Paper Plus Supplies', 'Paper Plus', '9876500005', 'care@paperplus.example'],
     ];
     for (const s of sups) {
-      await pool.query('INSERT IGNORE INTO suppliers (name, company_name, phone, email) VALUES (?,?,?,?)', s);
+      await pool.query('INSERT OR IGNORE INTO suppliers (name, company_name, phone, email) VALUES (?,?,?,?)', s);
     }
     const [catRows] = await pool.query('SELECT id, name FROM categories');
     const [supRows] = await pool.query('SELECT id, email FROM suppliers');
@@ -817,11 +906,11 @@ async function seed() {
     let n = 0;
     for (const [name, sku, cat, si, brand, buy, sell, tax, stock, min, days] of prods) {
       n += 1;
-      const expiry = days === null ? 'NULL' : 'DATE_ADD(CURDATE(), INTERVAL ? DAY)';
+      const expiry = days === null ? 'NULL' : "date('now','localtime',?)";
       const args = [name, sku, `890100${String(n).padStart(4, '0')}`, catId[cat], supId[sups[si][3]], brand, buy, sell, tax, min, min * 3];
-      if (days !== null) args.push(days);
+      if (days !== null) args.push(`${days >= 0 ? '+' : ''}${days} days`);
       const [r] = await pool.query(
-        `INSERT IGNORE INTO products (name, sku, barcode, category_id, supplier_id, brand, purchase_price, selling_price,
+        `INSERT OR IGNORE INTO products (name, sku, barcode, category_id, supplier_id, brand, purchase_price, selling_price,
           tax_percentage, current_stock, min_stock_level, reorder_quantity, expiry_date)
          VALUES (?,?,?,?,?,?,?,?,?,0,?,?,${expiry})`, args);
       if (r.affectedRows === 1 && stock > 0) await changeStock(pool, r.insertId, stock, 'PURCHASE', admin.id, 'Opening stock');

@@ -1,7 +1,6 @@
-// Starts the SmartBiz API server and the Vite client together.
+// Starts Vite; its dev-only plugin starts and stops the SmartBiz API server.
 // Usage: npm run dev [-- --host 127.0.0.1 --port 5173]
-// Host/port arguments are forwarded to Vite; the API always runs on its own
-// configured port (default 5000).
+// Host and port arguments are forwarded to Vite.
 const { spawn } = require('child_process');
 const path = require('path');
 
@@ -18,10 +17,6 @@ const isWin = process.platform === 'win32';
 const viteBin = path.join(root, 'client', 'node_modules', 'vite', 'bin', 'vite.js');
 
 const children = [
-  spawn(process.execPath, [path.join(root, 'server', 'server.js')], {
-    cwd: path.join(root, 'server'),
-    stdio: 'inherit',
-  }),
   spawn(process.execPath, [viteBin, '--host', host, '--port', port], {
     cwd: path.join(root, 'client'),
     stdio: 'inherit',

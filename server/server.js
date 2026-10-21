@@ -10,6 +10,8 @@ const { body, validationResult } = require('express-validator');
 const path = require('path');
 const multer = require('multer');
 const fs = require('fs');
+const { createAiBusinessData } = require('./aiBusinessData');
+const { answerLocalQuestion } = require('./aiLocalAssistant');
 
 // ---------- Database ----------
 // The app now runs on an embedded SQLite database (node:sqlite, no external
@@ -164,6 +166,17 @@ const loginLimiter = rateLimit({
   message: { message: 'Too many login attempts. Please try again in 15 minutes.' },
 });
 
+const aiChatLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 20,
+  keyGenerator: (req) => `user:${req.user.id}`,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => res.status(429).json({
+    message: 'AI chat request limit reached. Please wait a few minutes and try again.',
+  }),
+});
+
 // ---------- App ----------
 const app = express();
 app.set('trust proxy', 1);
@@ -192,7 +205,7 @@ app.use(cors({
 app.use(express.json({ limit: '1mb' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', aiAssistant: 'local' }));
 
 // ---------- Auth routes ----------
 app.post(
@@ -263,6 +276,57 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
 const httpError = (status, message) => Object.assign(new Error(message), { status });
 const emptyToNull = (v) => (v === '' || v === undefined ? null : v);
 const MANAGERS = ['ADMIN', 'MANAGER'];
+
+const aiPayloadLimit = (req, res, next) => {
+  if (Buffer.byteLength(JSON.stringify(req.body || {}), 'utf8') > 24 * 1024) {
+    return res.status(413).json({ message: 'Chat request is too large. Start a new conversation and try again.' });
+  }
+  next();
+};
+
+const aiChatRules = [
+  body('messages')
+    .isArray({ min: 1, max: 12 })
+    .withMessage('Include between 1 and 12 conversation messages.')
+    .custom((messages) => Array.isArray(messages)
+      && messages.reduce((length, message) => length + (typeof message?.content === 'string' ? message.content.length : 0), 0) <= 12000)
+    .withMessage('Conversation context is too long. Start a new conversation.'),
+  body('messages.*.role')
+    .isIn(['user', 'assistant'])
+    .withMessage('Conversation messages must have a user or assistant role.'),
+  body('messages.*.content')
+    .isString()
+    .trim()
+    .isLength({ min: 1, max: 2000 })
+    .withMessage('Each message must contain between 1 and 2,000 characters.'),
+  body('messages').custom((messages) => Array.isArray(messages)
+    && messages[messages.length - 1]?.role === 'user')
+    .withMessage('The last conversation message must be from the user.'),
+];
+
+app.post(
+  '/api/ai/chat',
+  authenticate,
+  aiChatLimiter,
+  aiPayloadLimit,
+  aiChatRules,
+  validate,
+  wrap(async (req, res) => {
+    try {
+      const businessData = createAiBusinessData(pool);
+      const message = await answerLocalQuestion({
+        messages: req.body.messages,
+        role: req.user.role,
+        businessData,
+      });
+      res.json({ message });
+    } catch (err) {
+      if (err.status === 403) return res.status(403).json({ message: err.message });
+      console.error('Local SmartBiz assistant request failed:', err.message);
+      throw httpError(500, 'Unable to answer that question from SmartBiz data. Please try again.');
+    }
+  })
+);
 
 // Turns MySQL errors into friendly messages
 const dbError = (err, dupMsgs = {}, inUseMsg = 'This record is in use and cannot be deleted.') => {

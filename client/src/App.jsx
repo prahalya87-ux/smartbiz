@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import ReactDOM from 'react-dom/client';
 import { BrowserRouter, Link, Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import axios from 'axios';
@@ -301,6 +301,258 @@ const NAV = [
   { to: '/notifications', label: 'Notifications', icon: 'bell' },
 ];
 
+const AI_SUGGESTIONS = [
+  'Which products are low in stock?',
+  "Show today's sales.",
+  'Which products are selling the most?',
+  'Predict my sales.',
+  'Which products should I reorder?',
+];
+
+function SmartBizAssistant() {
+  const [isOpen, setIsOpen] = useState(false);
+  const [isMinimized, setIsMinimized] = useState(false);
+  const [input, setInput] = useState('');
+  const [messages, setMessages] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [errorRetryable, setErrorRetryable] = useState(true);
+  const [retryPrompt, setRetryPrompt] = useState('');
+  const conversationRef = useRef(null);
+  const requestId = useRef(0);
+
+  useEffect(() => {
+    if (conversationRef.current) {
+      conversationRef.current.scrollTop = conversationRef.current.scrollHeight;
+    }
+  }, [messages, isLoading, error, isOpen, isMinimized]);
+
+  const startNewConversation = () => {
+    requestId.current += 1;
+    setMessages([]);
+    setInput('');
+    setIsLoading(false);
+    setError('');
+    setErrorRetryable(true);
+    setRetryPrompt('');
+  };
+
+  const sendMessage = async (event, messageText = input, isRetry = false) => {
+    event?.preventDefault();
+    const message = messageText.trim();
+    if (!message || isLoading) return;
+
+    const activeRequest = requestId.current + 1;
+    requestId.current = activeRequest;
+    const nextMessages = isRetry
+      ? messages
+      : [...messages, { id: activeRequest, role: 'user', text: message }];
+    const contextMessages = nextMessages.slice(-12).map(({ role, text }) => ({ role, content: text }));
+    while (contextMessages.length > 1
+      && contextMessages.reduce((length, item) => length + item.content.length, 0) > 12000) {
+      contextMessages.shift();
+    }
+    if (!isRetry) {
+      setMessages(nextMessages);
+      setInput('');
+    }
+    setError('');
+    setErrorRetryable(true);
+    setRetryPrompt(message);
+    setIsLoading(true);
+
+    try {
+      const { data } = await api.post('/ai/chat', {
+        messages: contextMessages,
+      });
+      if (requestId.current !== activeRequest) return;
+      if (typeof data.message !== 'string' || !data.message.trim()) {
+        throw new Error('SmartBiz Assistant returned an empty response. Please retry.');
+      }
+      setMessages((current) => [...current, {
+        id: `${activeRequest}-assistant`,
+        role: 'assistant',
+        text: data.message.trim(),
+      }]);
+      setRetryPrompt('');
+    } catch (err) {
+      if (requestId.current === activeRequest) {
+        const status = err.response?.status;
+        const serverMessage = err.response?.data?.message || '';
+        const staleAiServer = /openai|api[_ -]?key/i.test(serverMessage);
+        setError(staleAiServer
+          ? 'This SmartBiz backend is still running an older AI integration. Restart the backend; no AI API key is required.'
+          : serverMessage || err.message || 'Unable to reach SmartBiz Assistant. Please retry.');
+        setErrorRetryable(!staleAiServer
+          && (status === undefined || status === 408 || status === 429 || status >= 500));
+      }
+    } finally {
+      if (requestId.current === activeRequest) setIsLoading(false);
+    }
+  };
+
+  const openAssistant = () => {
+    setIsOpen(true);
+    setIsMinimized(false);
+  };
+
+  return (
+    <>
+      {isOpen && !isMinimized && (
+        <section className="sb-ai-panel" aria-label="SmartBiz AI Assistant">
+          <header className="sb-ai-header">
+            <div className="d-flex align-items-center gap-2">
+              <span className="sb-ai-header-icon" aria-hidden="true"><i className="bi bi-stars"></i></span>
+              <div>
+                <h2 className="sb-ai-title">SmartBiz AI Assistant</h2>
+                <span className="sb-ai-subtitle">Here to help with your business</span>
+              </div>
+            </div>
+            <div className="d-flex align-items-center gap-1">
+              <button type="button" className="sb-ai-icon-button" aria-label="New conversation" title="New conversation"
+                onClick={startNewConversation}>
+                <i className="bi bi-plus-lg" aria-hidden="true"></i>
+              </button>
+              <button type="button" className="sb-ai-icon-button" aria-label="Minimize assistant" title="Minimize"
+                onClick={() => setIsMinimized(true)}>
+                <i className="bi bi-dash-lg" aria-hidden="true"></i>
+              </button>
+              <button type="button" className="sb-ai-icon-button" aria-label="Close assistant" title="Close"
+                onClick={() => { setIsOpen(false); setIsMinimized(false); }}>
+                <i className="bi bi-x-lg" aria-hidden="true"></i>
+              </button>
+            </div>
+          </header>
+
+          <div className="sb-ai-conversation" ref={conversationRef} aria-live="polite">
+            {messages.length === 0 ? (
+              <div className="sb-ai-welcome">
+                <div className="sb-ai-welcome-mark" aria-hidden="true"><i className="bi bi-stars"></i></div>
+                <div className="sb-ai-bubble sb-ai-assistant-bubble">
+                  Hi! I'm your SmartBiz AI Assistant. How can I help you manage your business today?
+                </div>
+                <p className="sb-ai-suggestion-label">Try asking</p>
+                <div className="sb-ai-suggestions">
+                  {AI_SUGGESTIONS.map((suggestion) => (
+                    <button key={suggestion} type="button" className="sb-ai-suggestion"
+                      onClick={(event) => sendMessage(event, suggestion)}>
+                      {suggestion}<i className="bi bi-arrow-up-left" aria-hidden="true"></i>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="sb-ai-message-list">
+                {messages.map((message) => (
+                  <div className={`sb-ai-message-row ${message.role === 'user' ? 'sb-ai-user-row' : ''}`} key={message.id}>
+                    <div className={`sb-ai-bubble ${message.role === 'user' ? 'sb-ai-user-bubble' : 'sb-ai-assistant-bubble'}`}>
+                      {message.text}
+                    </div>
+                  </div>
+                ))}
+                {isLoading && (
+                  <div className="sb-ai-message-row" role="status" aria-label="Waiting for assistant">
+                    <div className="sb-ai-bubble sb-ai-assistant-bubble sb-ai-loading">
+                      <span></span><span></span><span></span>
+                    </div>
+                  </div>
+                )}
+                {error && (
+                  <div className="sb-ai-error" role="alert">
+                    <i className="bi bi-info-circle" aria-hidden="true"></i>
+                    <span>{error}</span>
+                    <button type="button" className="sb-ai-retry"
+                      onClick={errorRetryable
+                        ? () => sendMessage(null, retryPrompt, true)
+                        : () => { setError(''); setRetryPrompt(''); }}
+                      disabled={isLoading || !retryPrompt}>
+                      {errorRetryable ? 'Retry' : 'Dismiss'}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          <form className="sb-ai-composer" onSubmit={sendMessage}>
+            <label htmlFor="sb-ai-message" className="visually-hidden">Message SmartBiz AI Assistant</label>
+            <textarea id="sb-ai-message" className="sb-ai-input" rows="1" placeholder="Ask a question..."
+              value={input} maxLength={2000} onChange={(event) => setInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault();
+                  sendMessage(event);
+                }
+              }} />
+            <button type="submit" className="sb-ai-send" disabled={!input.trim() || isLoading} aria-label="Send message">
+              <i className="bi bi-arrow-up" aria-hidden="true"></i>
+            </button>
+            <span className="sb-ai-composer-hint">Enter to send · Shift+Enter for a new line</span>
+          </form>
+        </section>
+      )}
+
+      {(!isOpen || isMinimized) && (
+        <button type="button" className="sb-ai-launcher" onClick={openAssistant}
+          aria-label={isMinimized ? 'Restore SmartBiz AI Assistant' : 'Ask SmartBiz AI'}
+          title="Ask SmartBiz AI" data-tooltip="Ask SmartBiz AI">
+          <i className="bi bi-stars" aria-hidden="true"></i>
+        </button>
+      )}
+
+      <style>{`
+        .sb-ai-panel,.sb-ai-launcher{font-family:inherit}
+        .sb-ai-panel{position:fixed;z-index:1050;right:24px;bottom:98px;width:min(390px,calc(100vw - 32px));height:min(620px,calc(100dvh - 122px));min-height:360px;display:flex;flex-direction:column;overflow:hidden;background:#fff;border:1px solid #e4eee7;border-radius:18px;box-shadow:0 18px 55px rgba(12,44,27,.2);animation:sb-ai-enter .2s ease-out}
+        .sb-ai-header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:14px 14px 14px 16px;color:#fff;background:linear-gradient(120deg,#11623b,#208c55)}
+        .sb-ai-header-icon{display:grid;place-items:center;width:36px;height:36px;border-radius:12px;background:rgba(255,255,255,.16);font-size:19px}
+        .sb-ai-title{margin:0;font-size:15px;font-weight:650;line-height:1.3}
+        .sb-ai-subtitle{font-size:11px;color:rgba(255,255,255,.8)}
+        .sb-ai-icon-button{display:grid;place-items:center;width:32px;height:32px;padding:0;border:0;border-radius:9px;color:#fff;background:transparent;transition:background .18s ease,transform .18s ease}
+        .sb-ai-icon-button:hover,.sb-ai-icon-button:focus-visible{background:rgba(255,255,255,.18);transform:translateY(-1px)}
+        .sb-ai-conversation{flex:1;min-height:0;overflow-y:auto;padding:20px 16px;background:#f7faf8;scrollbar-color:#c4d7ca transparent;scrollbar-width:thin}
+        .sb-ai-welcome{display:flex;flex-direction:column;align-items:flex-start}
+        .sb-ai-welcome-mark{display:grid;place-items:center;width:38px;height:38px;margin:0 0 10px;border-radius:13px;color:#16824b;background:#e3f3e9;font-size:19px}
+        .sb-ai-bubble{max-width:88%;padding:11px 13px;border-radius:15px;font-size:13px;line-height:1.55;overflow-wrap:anywhere}
+        .sb-ai-assistant-bubble{color:#26352b;background:#fff;border:1px solid #e8eee9;border-top-left-radius:5px;box-shadow:0 2px 7px rgba(20,48,29,.04)}
+        .sb-ai-suggestion-label{margin:22px 0 9px;color:#728076;font-size:11px;font-weight:650;letter-spacing:.04em;text-transform:uppercase}
+        .sb-ai-suggestions{display:flex;flex-direction:column;align-items:flex-start;gap:8px;width:100%}
+        .sb-ai-suggestion{display:flex;align-items:center;justify-content:space-between;gap:12px;width:100%;padding:9px 11px;border:1px solid #dfeae2;border-radius:11px;color:#315440;background:#fff;text-align:left;font-size:12px;transition:border-color .18s ease,background .18s ease,transform .18s ease}
+        .sb-ai-suggestion i{color:#16824b;opacity:0;transition:opacity .18s ease}
+        .sb-ai-suggestion:hover,.sb-ai-suggestion:focus-visible{border-color:#6db687;background:#f0f8f2;transform:translateY(-1px)}
+        .sb-ai-suggestion:hover i,.sb-ai-suggestion:focus-visible i{opacity:1}
+        .sb-ai-message-list{display:flex;flex-direction:column;gap:13px}
+        .sb-ai-message-row{display:flex;align-items:flex-end}
+        .sb-ai-user-row{justify-content:flex-end}
+        .sb-ai-user-bubble{color:#fff;background:#16824b;border-bottom-right-radius:5px}
+        .sb-ai-error{display:flex;align-items:flex-start;gap:8px;margin-top:2px;padding:10px 11px;border:1px solid #f3d4a4;border-radius:11px;color:#735319;background:#fff8e9;font-size:12px;line-height:1.45}
+        .sb-ai-error i{flex:none;margin-top:1px}
+        .sb-ai-retry{flex:none;padding:2px 7px;border:1px solid #e6cf9f;border-radius:7px;color:#735319;background:#fff;font-size:11px}
+        .sb-ai-retry:hover:not(:disabled){background:#fff0ce}
+        .sb-ai-retry:disabled{cursor:not-allowed;opacity:.55}
+        .sb-ai-loading{display:flex;gap:4px;align-items:center;height:37px}
+        .sb-ai-loading span{width:6px;height:6px;border-radius:50%;background:#60a777;animation:sb-ai-dot 1s infinite ease-in-out}
+        .sb-ai-loading span:nth-child(2){animation-delay:.15s}.sb-ai-loading span:nth-child(3){animation-delay:.3s}
+        .sb-ai-composer{position:relative;display:flex;align-items:flex-end;gap:8px;padding:12px 13px 28px;border-top:1px solid #eaf0eb;background:#fff}
+        .sb-ai-input{flex:1;min-width:0;max-height:100px;resize:none;padding:10px 12px;border:1px solid #dce7de;border-radius:12px;color:#24352a;background:#fbfdfb;font:inherit;font-size:13px;line-height:1.45;outline:none}
+        .sb-ai-input:focus{border-color:#62a77a;box-shadow:0 0 0 3px rgba(39,137,78,.12)}
+        .sb-ai-send{display:grid;place-items:center;flex:none;width:38px;height:38px;border:0;border-radius:12px;color:#fff;background:#16824b;font-size:19px;transition:background .18s ease,transform .18s ease}
+        .sb-ai-send:not(:disabled):hover{background:#10663a;transform:translateY(-1px)}
+        .sb-ai-send:disabled{cursor:not-allowed;opacity:.45}
+        .sb-ai-composer-hint{position:absolute;bottom:9px;left:16px;color:#87948b;font-size:10px}
+        .sb-ai-launcher{position:fixed;z-index:1051;right:24px;bottom:24px;display:grid;place-items:center;width:58px;height:58px;padding:0;border:1px solid rgba(255,255,255,.4);border-radius:50%;color:#fff;background:linear-gradient(145deg,#239356,#11663b);box-shadow:0 7px 22px rgba(18,110,60,.32),0 0 0 5px rgba(35,147,86,.08);font-size:25px;cursor:pointer;transition:transform .2s ease,box-shadow .2s ease,filter .2s ease}
+        .sb-ai-launcher:hover,.sb-ai-launcher:focus-visible{transform:translateY(-3px) scale(1.04);filter:brightness(1.05);box-shadow:0 11px 28px rgba(18,110,60,.4),0 0 0 7px rgba(35,147,86,.11)}
+        .sb-ai-launcher:focus-visible,.sb-ai-icon-button:focus-visible,.sb-ai-suggestion:focus-visible,.sb-ai-send:focus-visible{outline:3px solid #a5d8b5;outline-offset:2px}
+        .sb-ai-launcher[data-tooltip]:hover:after,.sb-ai-launcher[data-tooltip]:focus-visible:after{position:absolute;right:68px;padding:7px 10px;border-radius:7px;color:#fff;background:#26352b;content:attr(data-tooltip);font-size:12px;font-weight:500;white-space:nowrap;box-shadow:0 3px 10px rgba(0,0,0,.16)}
+        @keyframes sb-ai-enter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes sb-ai-dot{0%,60%,100%{opacity:.35;transform:translateY(0)}30%{opacity:1;transform:translateY(-3px)}}
+        @media(max-width:767px){.sb-ai-panel{right:16px;bottom:90px;width:min(390px,calc(100vw - 32px));height:min(620px,calc(100dvh - 108px))}.sb-ai-launcher{right:18px;bottom:18px;width:54px;height:54px}}
+        @media(max-width:420px){.sb-ai-panel{right:10px;bottom:82px;width:calc(100vw - 20px);height:min(620px,calc(100dvh - 96px));min-height:320px;border-radius:15px}.sb-ai-launcher{right:14px;bottom:14px}}
+        @media(prefers-reduced-motion:reduce){.sb-ai-panel,.sb-ai-panel *,.sb-ai-launcher{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+      `}</style>
+    </>
+  );
+}
+
 function Layout() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
@@ -385,6 +637,7 @@ function Layout() {
           <Outlet />
         </main>
       </div>
+      <SmartBizAssistant />
     </div>
   );
 }

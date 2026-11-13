@@ -9,7 +9,9 @@ states and do not receive management sales data.
 
 Inventory supports in-app camera scanning and handheld barcode scanners that
 type a code into the "Scan & receive stock" flow. Camera access requires
-browser permission and HTTPS or localhost. Existing products are matched by
+browser permission and HTTPS or localhost. Camera decoding tries common retail
+1D and 2D barcode formats, but damaged, blurred, or obscured labels may still
+need a handheld scanner or manual entry. Existing products are matched by
 barcode; new numeric barcodes can be looked up in Open Food Facts for name,
 brand, and category suggestions (source:
 [Open Food Facts](https://world.openfoodfacts.org/)). Verify catalog suggestions

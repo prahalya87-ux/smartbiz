@@ -32,7 +32,13 @@ api.interceptors.response.use(
   }
 );
 
-const getErrorMessage = (err) => err.response?.data?.message || 'Unable to reach the server. Please try again.';
+const getErrorMessage = (err) => {
+  const isAccountRoute = /^\/auth\/(login|signup|forgot-password|reset-password)$/.test(err.config?.url || '');
+  if (err.response?.status === 404 && isAccountRoute) {
+    return 'The account service is missing on the server. Please ask the administrator to deploy the latest SmartBiz API.';
+  }
+  return err.response?.data?.message || 'Unable to reach the server. Please try again.';
+};
 
 // ---------- Auth context ----------
 const AuthContext = createContext(null);
@@ -1698,12 +1704,43 @@ function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
       let requestTimedOut = false;
       let stream;
       try {
-        const { BrowserMultiFormatReader } = await import('@zxing/browser');
+        const [{ BrowserMultiFormatReader, BarcodeFormat }, { DecodeHintType }] = await Promise.all([
+          import('@zxing/browser'),
+          import('@zxing/library'),
+        ]);
         if (cancelled) return;
-        const reader = new BrowserMultiFormatReader();
+        const hints = new Map([
+          [DecodeHintType.POSSIBLE_FORMATS, [
+            BarcodeFormat.AZTEC,
+            BarcodeFormat.CODABAR,
+            BarcodeFormat.CODE_39,
+            BarcodeFormat.CODE_93,
+            BarcodeFormat.CODE_128,
+            BarcodeFormat.DATA_MATRIX,
+            BarcodeFormat.EAN_8,
+            BarcodeFormat.EAN_13,
+            BarcodeFormat.ITF,
+            BarcodeFormat.MAXICODE,
+            BarcodeFormat.PDF_417,
+            BarcodeFormat.QR_CODE,
+            BarcodeFormat.RSS_14,
+            BarcodeFormat.RSS_EXPANDED,
+            BarcodeFormat.UPC_A,
+            BarcodeFormat.UPC_E,
+          ]],
+          [DecodeHintType.TRY_HARDER, true],
+        ]);
+        const reader = new BrowserMultiFormatReader(hints, {
+          delayBetweenScanSuccess: 250,
+          delayBetweenScanAttempts: 100,
+        });
         const cameraRequest = navigator.mediaDevices.getUserMedia({
           audio: false,
-          video: { facingMode: { ideal: 'environment' } },
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
         }).then((mediaStream) => {
           if (cancelled || requestTimedOut) {
             mediaStream.getTracks().forEach((track) => track.stop());
@@ -1897,7 +1934,7 @@ function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
           <video
             ref={videoRef}
             className="w-100 rounded bg-dark"
-            style={{ maxHeight: 320, minHeight: 180, objectFit: 'cover' }}
+            style={{ maxHeight: 320, minHeight: 180, objectFit: 'contain' }}
             muted
             playsInline
             aria-label="Live camera barcode preview"

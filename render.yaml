@@ -3,6 +3,8 @@ services:
     name: smartbiz-server-cfmp
     runtime: node
     plan: free
+    branch: main
+    autoDeploy: true
     buildCommand: npm ci --prefix server && npm ci --prefix client && npm --prefix client run build
     startCommand: npm --prefix server start
     healthCheckPath: /api/health

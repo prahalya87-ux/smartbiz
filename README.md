@@ -73,6 +73,13 @@ typically `http://localhost:5173`). To use MySQL locally, also set `MYSQL_URL`
 to its connection URL. Without it, the backend uses SQLite. No AI provider key
 is required.
 
+Password recovery emails require `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`,
+`SMTP_PASS`, and `SMTP_FROM` in the server environment. Use `SMTP_SECURE=true`
+for implicit TLS (usually port 465); port 587 uses STARTTLS by default. Keep
+these settings private and configure them in both `server/.env` and the
+production API environment. Reset codes expire after 10 minutes and can only be
+used once.
+
 Start both app processes from the project root with `npm run dev`. To run them
 separately in different terminals, use `npm --prefix server run dev` and
 `npm --prefix client run dev`. The Vite development setup checks `VITE_API_URL`
@@ -98,9 +105,9 @@ the database that contains the accounts you want to use. Accounts are
 created from the sign-up page and become active immediately. The first
 registered account receives the Admin role; subsequent sign-ups receive Staff
 access. Admins can create employee accounts with Manager, Cashier, or Staff
-roles. Public sign-up cannot select a role, and SmartBiz does not send
-email-verification or password-reset links. No demo accounts are created
-automatically.
+roles. Public sign-up cannot select a role. SmartBiz does not send
+email-verification links; password recovery uses a one-time email code. No demo
+accounts are created automatically.
 
 Render's free service may sleep, and its local filesystem is ephemeral. Keep
 business data in Aiven, not on the Render filesystem. The deployed service

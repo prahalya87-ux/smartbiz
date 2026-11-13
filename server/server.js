@@ -4,21 +4,43 @@ const cors = require('cors');
 const helmet = require('helmet');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
 const { DatabaseSync } = require('node:sqlite');
 const mysql = require('mysql2/promise');
 const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
+const { createHash } = require('node:crypto');
 const path = require('path');
 const multer = require('multer');
 const fs = require('fs');
 const { createAiBusinessData } = require('./aiBusinessData');
 const { answerLocalQuestion } = require('./aiLocalAssistant');
 const { isSupportedBarcode, lookupBarcode } = require('./barcodeCatalog');
+const {
+  PASSWORD_RESET_CODE_TTL_MS,
+  PASSWORD_RESET_MAX_ATTEMPTS,
+  createPasswordResetCode,
+  passwordResetCodeMatches,
+} = require('./passwordReset');
 
 // ---------- Database ----------
 const MYSQL_URL = process.env.MYSQL_URL;
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'smartbiz.db');
 const useMysql = Boolean(MYSQL_URL);
+const passwordResetSecret = process.env.PASSWORD_RESET_SECRET || process.env.JWT_SECRET;
+const smtpHost = process.env.SMTP_HOST;
+const smtpPort = Number(process.env.SMTP_PORT || 587);
+const smtpUser = process.env.SMTP_USER;
+const smtpPass = process.env.SMTP_PASS;
+const smtpFrom = process.env.SMTP_FROM || smtpUser;
+const mailTransport = smtpHost && smtpPort && smtpUser && smtpPass && smtpFrom
+  ? nodemailer.createTransport({
+    host: smtpHost,
+    port: smtpPort,
+    secure: process.env.SMTP_SECURE === 'true' || (smtpPort === 465 && process.env.SMTP_SECURE !== 'false'),
+    auth: { user: smtpUser, pass: smtpPass },
+  })
+  : null;
 let db = null;
 let mysqlPool = null;
 
@@ -258,6 +280,37 @@ const aiChatLimiter = rateLimit({
   }),
 });
 
+const passwordResetRequestIpLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many password reset requests. Please try again later.' },
+});
+const passwordResetRequestEmailLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 3,
+  keyGenerator: (req) => `email:${createHash('sha256').update(String(req.body.email || '').trim().toLowerCase()).digest('hex')}`,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many password reset requests for this email. Please try again later.' },
+});
+const passwordResetVerifyIpLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many password reset attempts. Please try again later.' },
+});
+const passwordResetVerifyEmailLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  keyGenerator: (req) => `email:${createHash('sha256').update(String(req.body.email || '').trim().toLowerCase()).digest('hex')}`,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many password reset attempts for this email. Please try again later.' },
+});
+
 // ---------- App ----------
 const app = express();
 app.set('trust proxy', 1);
@@ -310,6 +363,150 @@ app.post(
       res.json({ token: signToken(user), user: { id: user.id, name: user.name, email: user.email, role: user.role } });
     } catch (err) {
       next(err);
+    }
+  }
+);
+
+app.post(
+  '/api/auth/forgot-password',
+  passwordResetRequestIpLimiter,
+  passwordResetRequestEmailLimiter,
+  body('email').trim().toLowerCase().isEmail().isLength({ max: 150 }).withMessage('Please enter a valid email address.'),
+  validate,
+  async (req, res, next) => {
+    if (!mailTransport || !passwordResetSecret) {
+      return res.status(503).json({
+        message: 'Password reset email is not configured. Please contact the administrator.',
+      });
+    }
+
+    try {
+      const email = req.body.email.trim().toLowerCase();
+      const [users] = await pool.query(
+        'SELECT id FROM users WHERE email = ? AND is_active = 1',
+        [email]
+      );
+      if (!users[0]) {
+        return res.status(202).json({
+          message: 'If an active account uses that email, a password reset code will be sent.',
+        });
+      }
+
+      const userId = users[0].id;
+      const { code, hash } = createPasswordResetCode(passwordResetSecret);
+      const expiresAt = Date.now() + PASSWORD_RESET_CODE_TTL_MS;
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginImmediateTransaction();
+        await conn.query('DELETE FROM password_reset_codes WHERE user_id = ?', [userId]);
+        await conn.query(
+          'INSERT INTO password_reset_codes (user_id, otp_hash, expires_at) VALUES (?,?,?)',
+          [userId, hash, expiresAt]
+        );
+        await conn.commit();
+      } catch (err) {
+        await conn.rollback();
+        throw err;
+      } finally {
+        await conn.release();
+      }
+
+      try {
+        await mailTransport.sendMail({
+          from: smtpFrom,
+          to: email,
+          subject: 'Your SmartBiz password reset code',
+          text: `Your SmartBiz password reset code is ${code}. It expires in 10 minutes. If you did not request this, you can ignore this email.`,
+          html: `<p>Your SmartBiz password reset code is:</p><p style="font-size:24px;font-weight:bold;letter-spacing:5px">${code}</p><p>It expires in 10 minutes. If you did not request this, you can ignore this email.</p>`,
+        });
+      } catch (err) {
+        console.error('Password reset email delivery failed:', err.message);
+        try {
+          await pool.query('DELETE FROM password_reset_codes WHERE user_id = ? AND otp_hash = ?', [userId, hash]);
+        } catch (cleanupError) {
+          console.error('Failed to remove undelivered password reset code:', cleanupError.message);
+        }
+      }
+
+      return res.status(202).json({
+        message: 'If an active account uses that email, a password reset code will be sent.',
+      });
+    } catch (err) {
+      return next(err);
+    }
+  }
+);
+
+app.post(
+  '/api/auth/reset-password',
+  passwordResetVerifyIpLimiter,
+  passwordResetVerifyEmailLimiter,
+  body('email').trim().toLowerCase().isEmail().isLength({ max: 150 }).withMessage('Please enter a valid email address.'),
+  body('code').trim().matches(/^\d{6}$/).withMessage('Enter the six-digit code from your email.'),
+  body('password')
+    .isStrongPassword({ minLength: 8, minLowercase: 1, minUppercase: 1, minNumbers: 1, minSymbols: 1 })
+    .withMessage('Password must be 8+ characters with uppercase, lowercase, number and symbol.'),
+  validate,
+  async (req, res, next) => {
+    if (!passwordResetSecret) {
+      return res.status(503).json({
+        message: 'Password reset is not configured. Please contact the administrator.',
+      });
+    }
+
+    let conn;
+    let inTransaction = false;
+    try {
+      const email = req.body.email.trim().toLowerCase();
+      conn = await pool.getConnection();
+      await conn.beginImmediateTransaction();
+      inTransaction = true;
+      const [rows] = await conn.query(
+        `SELECT c.user_id, c.otp_hash, c.expires_at, c.attempts, u.is_active
+         FROM password_reset_codes c JOIN users u ON u.id = c.user_id
+         WHERE u.email = ?${useMysql ? ' FOR UPDATE' : ''}`,
+        [email]
+      );
+      const reset = rows[0];
+      let resetUserId = null;
+      let validCode = Boolean(reset && reset.is_active);
+
+      if (!validCode) {
+        if (reset) await conn.query('DELETE FROM password_reset_codes WHERE user_id = ?', [reset.user_id]);
+      } else if (Number(reset.expires_at) <= Date.now() || Number(reset.attempts) >= PASSWORD_RESET_MAX_ATTEMPTS) {
+        await conn.query('DELETE FROM password_reset_codes WHERE user_id = ?', [reset.user_id]);
+        validCode = false;
+      } else if (!passwordResetCodeMatches(req.body.code, reset.otp_hash, passwordResetSecret)) {
+        const attempts = Number(reset.attempts) + 1;
+        if (attempts >= PASSWORD_RESET_MAX_ATTEMPTS) {
+          await conn.query('DELETE FROM password_reset_codes WHERE user_id = ?', [reset.user_id]);
+        } else {
+          await conn.query('UPDATE password_reset_codes SET attempts = ? WHERE user_id = ?', [attempts, reset.user_id]);
+        }
+        validCode = false;
+      } else {
+        resetUserId = reset.user_id;
+        const passwordHash = await bcrypt.hash(req.body.password, 10);
+        await conn.query(
+          'UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND is_active = 1',
+          [passwordHash, resetUserId]
+        );
+        await conn.query('DELETE FROM password_reset_codes WHERE user_id = ?', [resetUserId]);
+      }
+
+      await conn.commit();
+      inTransaction = false;
+      if (!validCode) {
+        return res.status(400).json({ message: 'The reset code is invalid or expired. Request a new code and try again.' });
+      }
+
+      await logAction(resetUserId, 'PASSWORD_RESET', 'user', resetUserId, null, req.ip);
+      return res.json({ message: 'Password updated. You can now sign in with your new password.' });
+    } catch (err) {
+      if (inTransaction) await conn.rollback();
+      return next(err);
+    } finally {
+      if (conn) await conn.release();
     }
   }
 );

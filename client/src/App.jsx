@@ -134,6 +134,11 @@ function Login() {
           <h1 className="h4 mt-2 mb-0">SmartBiz</h1>
           <p className="text-secondary small">Inventory, sales &amp; business insights</p>
         </div>
+        {location.state?.passwordReset && (
+          <div className="alert alert-success py-2" role="status">
+            Your password has been updated. Sign in with your new password.
+          </div>
+        )}
         <form onSubmit={handleSubmit}>
           <div className="mb-3">
             <label htmlFor="email" className="form-label">Email</label>
@@ -144,6 +149,9 @@ function Login() {
             <label htmlFor="password" className="form-label">Password</label>
             <input id="password" name="password" type="password" className="form-control" required
               autoComplete="current-password" value={form.password} onChange={handleChange} />
+            <div className="text-end mt-1">
+              <Link to="/forgot-password" state={{ email: form.email }} className="small">Forgot password?</Link>
+            </div>
           </div>
           <button className="btn btn-primary w-100" disabled={submitting}>
             {submitting ? 'Signing in...' : 'Sign in'}
@@ -151,6 +159,116 @@ function Login() {
         </form>
         <p className="text-center text-secondary small mt-3 mb-0">
           New to SmartBiz? <Link to="/register">Create an account</Link>
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function ForgotPassword() {
+  const { user } = useAuth();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [step, setStep] = useState('request');
+  const [email, setEmail] = useState(location.state?.email || '');
+  const [code, setCode] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  if (user) return <Navigate to="/dashboard" replace />;
+
+  const requestCode = async (event) => {
+    event.preventDefault();
+    setSubmitting(true);
+    setError('');
+    setMessage('');
+    try {
+      const { data } = await api.post('/auth/forgot-password', { email });
+      setMessage(data.message);
+      setStep('verify');
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const resetPassword = async (event) => {
+    event.preventDefault();
+    if (password !== confirmPassword) {
+      setError('Passwords do not match.');
+      return;
+    }
+    setSubmitting(true);
+    setError('');
+    try {
+      await api.post('/auth/reset-password', { email, code, password });
+      navigate('/login', { replace: true, state: { passwordReset: true } });
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="container d-flex align-items-center justify-content-center min-vh-100 py-4">
+      <div className="card p-4 shadow-sm" style={{ maxWidth: 460, width: '100%' }}>
+        <div className="text-center mb-4">
+          <i className="bi bi-box-seam fs-1 text-primary" aria-hidden="true"></i>
+          <h1 className="h4 mt-2 mb-0">Reset your password</h1>
+          <p className="text-secondary small mb-0">Verify your email to choose a new password</p>
+        </div>
+        {error && <div className="alert alert-danger py-2" role="alert">{error}</div>}
+        {message && <div className="alert alert-info py-2" role="status">{message}</div>}
+
+        {step === 'request' ? (
+          <form onSubmit={requestCode}>
+            <div className="mb-3">
+              <label htmlFor="reset-email" className="form-label">Account email</label>
+              <input id="reset-email" type="email" className="form-control" required maxLength={150}
+                autoComplete="email" autoFocus value={email} onChange={(event) => setEmail(event.target.value)} />
+            </div>
+            <button className="btn btn-primary w-100" disabled={submitting}>
+              {submitting ? 'Sending code...' : 'Email me a reset code'}
+            </button>
+          </form>
+        ) : (
+          <form onSubmit={resetPassword}>
+            <div className="mb-3">
+              <label htmlFor="reset-code" className="form-label">Six-digit email code</label>
+              <input id="reset-code" type="text" inputMode="numeric" pattern="[0-9]{6}" maxLength={6}
+                className="form-control" required autoComplete="one-time-code" autoFocus value={code}
+                onChange={(event) => setCode(event.target.value.replace(/\D/g, '').slice(0, 6))} />
+              <div className="form-text">The code expires in 10 minutes. Check your spam folder if needed.</div>
+            </div>
+            <div className="mb-3">
+              <label htmlFor="reset-new-password" className="form-label">New password</label>
+              <input id="reset-new-password" type="password" className="form-control" required minLength={8}
+                autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} />
+              <div className="form-text">Use at least 8 characters with uppercase, lowercase, a number, and a symbol.</div>
+            </div>
+            <div className="mb-3">
+              <label htmlFor="reset-confirm-password" className="form-label">Confirm new password</label>
+              <input id="reset-confirm-password" type="password" className="form-control" required
+                autoComplete="new-password" value={confirmPassword}
+                onChange={(event) => setConfirmPassword(event.target.value)} />
+            </div>
+            <button className="btn btn-primary w-100" disabled={submitting}>
+              {submitting ? 'Updating password...' : 'Reset password'}
+            </button>
+            <button type="button" className="btn btn-link w-100 mt-2" disabled={submitting}
+              onClick={() => { setStep('request'); setCode(''); setMessage(''); setError(''); }}>
+              Use a different email or request a new code
+            </button>
+          </form>
+        )}
+
+        <p className="text-center text-secondary small mt-3 mb-0">
+          Remembered it? <Link to="/login">Sign in</Link>
         </p>
       </div>
     </div>
@@ -2101,6 +2219,7 @@ function App() {
     <Routes>
       <Route path="/" element={<Navigate to="/dashboard" replace />} />
       <Route path="/login" element={<Login />} />
+      <Route path="/forgot-password" element={<ForgotPassword />} />
       <Route path="/register" element={<Register />} />
       <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
         <Route path="/dashboard" element={<Dashboard />} />

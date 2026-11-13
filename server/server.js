@@ -5,6 +5,7 @@ const helmet = require('helmet');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { DatabaseSync } = require('node:sqlite');
+const mysql = require('mysql2/promise');
 const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
 const path = require('path');
@@ -12,38 +13,54 @@ const multer = require('multer');
 const fs = require('fs');
 const { createAiBusinessData } = require('./aiBusinessData');
 const { answerLocalQuestion } = require('./aiLocalAssistant');
+const { isSupportedBarcode, lookupBarcode } = require('./barcodeCatalog');
 
 // ---------- Database ----------
-// The app now runs on an embedded SQLite database (node:sqlite, no external
-// server needed), so "server unavailable" can no longer come from a remote
-// MySQL host being down. The rest of this file keeps the mysql2 pool API
-// shape:  const [rows] = await pool.query(sql, params)
-
+const MYSQL_URL = process.env.MYSQL_URL;
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'smartbiz.db');
-const db = new DatabaseSync(DB_PATH);
-db.exec(fs.readFileSync(path.join(__dirname, 'schema.sqlite.sql'), 'utf8'));
+const useMysql = Boolean(MYSQL_URL);
+let db = null;
+let mysqlPool = null;
 
-if (process.env.NODE_ENV === 'development') {
-  const demoUsers = [
-    ['Admin User', 'admin@smartbiz.com', 'Admin@123', 'ADMIN'],
-    ['Manager User', 'manager@smartbiz.com', 'Manager@123', 'MANAGER'],
-    ['Cashier User', 'cashier@smartbiz.com', 'Cashier@123', 'CASHIER'],
-    ['Staff User', 'staff@smartbiz.com', 'Staff@123', 'STAFF'],
-  ];
-  const findUser = db.prepare('SELECT 1 FROM users WHERE email = ?');
-  const findRole = db.prepare('SELECT id FROM roles WHERE name = ?');
-  const insertUser = db.prepare('INSERT INTO users (name, email, password_hash, role_id) VALUES (?,?,?,?)');
-  for (const [name, email, password, role] of demoUsers) {
-    if (findUser.get(email)) continue;
-    const roleRow = findRole.get(role);
-    if (roleRow) insertUser.run(name, email, bcrypt.hashSync(password, 10), roleRow.id);
+if (useMysql) {
+  let connectionUrl;
+  try {
+    connectionUrl = new URL(MYSQL_URL);
+  } catch {
+    throw new Error('MYSQL_URL must be a valid connection URL.');
   }
+  if (!['mysql:', 'mysql2:'].includes(connectionUrl.protocol)) {
+    throw new Error('MYSQL_URL must use the mysql:// scheme.');
+  }
+  if (!connectionUrl.hostname || !connectionUrl.username || !connectionUrl.password || !connectionUrl.pathname.slice(1)) {
+    throw new Error('MYSQL_URL must include the Aiven host, username, password, and database name.');
+  }
+  const ca = fs.readFileSync(path.join(__dirname, 'ca.pem'), 'utf8');
+  mysqlPool = mysql.createPool({
+    host: connectionUrl.hostname,
+    port: Number(connectionUrl.port || 3306),
+    user: decodeURIComponent(connectionUrl.username),
+    password: decodeURIComponent(connectionUrl.password),
+    database: decodeURIComponent(connectionUrl.pathname.replace(/^\//, '')),
+    ssl: { ca },
+    waitForConnections: true,
+    connectionLimit: 10,
+    charset: 'utf8mb4',
+    dateStrings: true,
+    decimalNumbers: true,
+  });
+} else {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('MYSQL_URL must be configured in production; refusing to start with local SQLite.');
+  }
+  db = new DatabaseSync(DB_PATH);
+  db.exec(fs.readFileSync(path.join(__dirname, 'schema.sqlite.sql'), 'utf8'));
 }
 
-// Rewrites mysql2 conveniences into plain SQLite:
+// Rewrites mysql2 conveniences for the active database:
 //  - array params inside IN (?) are expanded to IN (?,?...)
 //  - bulk "VALUES ?" with rows of arrays becomes VALUES (...),(...)
-//  - booleans / undefined / Date objects become SQLite-friendly values
+//  - values are normalized for SQLite
 const expandPlaceholders = (sql, params) => {
   let out = '';
   let rest = sql;
@@ -76,6 +93,13 @@ const expandPlaceholders = (sql, params) => {
 
 const runQuery = (sql, params = []) => {
   const [finalSql, flat] = expandPlaceholders(sql, params);
+  if (useMysql) {
+    const mysqlSql = finalSql.replace(/\bINSERT\s+OR\s+IGNORE\s+INTO\b/gi, 'INSERT IGNORE INTO');
+    return mysqlPool.query(mysqlSql, flat).catch((err) => {
+      err.sqlMessage = err.sqlMessage || err.message;
+      throw err;
+    });
+  }
   try {
     const stmt = db.prepare(finalSql);
     if (/^\s*(SELECT|WITH|PRAGMA)\b/i.test(finalSql)) return [stmt.all(...flat), undefined];
@@ -95,17 +119,66 @@ const runQuery = (sql, params = []) => {
 const pool = {
   query: async (sql, params) => runQuery(sql, params || []),
   getConnection: async () => {
+    if (useMysql) {
+      const connection = await mysqlPool.getConnection();
+      return {
+        query: async (sql, params) => {
+          const [finalSql, flat] = expandPlaceholders(sql, params || []);
+          return connection.query(
+            finalSql.replace(/\bINSERT\s+OR\s+IGNORE\s+INTO\b/gi, 'INSERT IGNORE INTO'),
+            flat
+          );
+        },
+        beginTransaction: () => connection.beginTransaction(),
+        beginImmediateTransaction: () => connection.beginTransaction(),
+        commit: () => connection.commit(),
+        rollback: () => connection.rollback(),
+        release: () => connection.release(),
+      };
+    }
     let inTx = false;
     return {
       query: async (sql, params) => runQuery(sql, params || []),
       beginTransaction: async () => { db.exec('BEGIN'); inTx = true; },
+      beginImmediateTransaction: async () => { db.exec('BEGIN IMMEDIATE'); inTx = true; },
       commit: async () => { db.exec('COMMIT'); inTx = false; },
       rollback: async () => { if (inTx) db.exec('ROLLBACK'); inTx = false; },
       release: async () => {},
     };
   },
-  end: async () => {},
+  end: async () => { if (mysqlPool) await mysqlPool.end(); },
 };
+
+let sqliteRegistrationTail = Promise.resolve();
+async function lockSqliteRegistration() {
+  let release;
+  const previous = sqliteRegistrationTail;
+  sqliteRegistrationTail = new Promise((resolve) => { release = resolve; });
+  await previous;
+  return release;
+}
+
+const TODAY_SQL = useMysql ? 'CURDATE()' : "date('now','localtime')";
+const NEXT_30_DAYS_SQL = useMysql ? 'DATE_ADD(CURDATE(), INTERVAL 30 DAY)' : "date('now','localtime','+30 days')";
+const SIX_MONTHS_AGO_SQL = useMysql
+  ? "DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 6 MONTH), '%Y-%m-01')"
+  : "date('now','localtime','start of month','-6 months')";
+const MONTH_FORMAT_SQL = (column) => (useMysql
+  ? `DATE_FORMAT(${column}, '%Y-%m')`
+  : `strftime('%Y-%m', ${column})`);
+const DAYS_LEFT_SQL = (column) => (useMysql
+  ? `DATEDIFF(${column}, CURDATE())`
+  : `CAST(julianday(${column}) - julianday(${TODAY_SQL}) AS INTEGER)`);
+
+async function initializeDatabase() {
+  if (useMysql) {
+    const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
+    for (const statement of schema.split(';').map((part) => part.trim()).filter(Boolean)) {
+      await mysqlPool.query(statement);
+    }
+  }
+
+}
 // ---------- Helpers ----------
 const logAction = async (userId, action, entity, entityId, details, ip) => {
   try {
@@ -164,6 +237,14 @@ const loginLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { message: 'Too many login attempts. Please try again in 15 minutes.' },
+});
+
+const signupLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many account creation attempts. Please try again later.' },
 });
 
 const aiChatLimiter = rateLimit({
@@ -233,6 +314,63 @@ app.post(
   }
 );
 
+app.post(
+  '/api/auth/signup',
+  signupLimiter,
+  body('name').trim().notEmpty().isLength({ max: 100 }).withMessage('Name is required and must be 100 characters or fewer.'),
+  body('email').trim().toLowerCase().isEmail().isLength({ max: 150 }).withMessage('Please enter a valid email address (maximum 150 characters).'),
+  body('password')
+    .isStrongPassword({ minLength: 8, minLowercase: 1, minUppercase: 1, minNumbers: 1, minSymbols: 1 })
+    .withMessage('Password must be 8+ characters with uppercase, lowercase, number and symbol.'),
+  validate,
+  async (req, res, next) => {
+    let conn;
+    let releaseRegistrationLock;
+    let inTransaction = false;
+    try {
+      if (!useMysql) releaseRegistrationLock = await lockSqliteRegistration();
+      conn = await pool.getConnection();
+      const { name, email, password } = req.body;
+      const passwordHash = await bcrypt.hash(password, 10);
+      await conn.beginImmediateTransaction();
+      inTransaction = true;
+
+      // Serialize account creation in MySQL as well as SQLite so only one signup can claim Admin.
+      await conn.query(
+        useMysql ? "SELECT id FROM roles WHERE name = 'ADMIN' FOR UPDATE" : "SELECT id FROM roles WHERE name = 'ADMIN'"
+      );
+      const [[userCount]] = await conn.query('SELECT COUNT(*) AS count FROM users');
+      const role = Number(userCount.count) === 0 ? 'ADMIN' : 'STAFF';
+      const [[roleRow]] = await conn.query('SELECT id FROM roles WHERE name = ?', [role]);
+      const [existing] = await conn.query('SELECT id FROM users WHERE email = ?', [email]);
+      if (existing.length) {
+        throw Object.assign(new Error('This email is already registered.'), { status: 409 });
+      }
+
+      const [result] = await conn.query(
+        'INSERT INTO users (name, email, password_hash, role_id, is_active) VALUES (?,?,?,?,1)',
+        [name, email, passwordHash, roleRow.id]
+      );
+      await conn.commit();
+      inTransaction = false;
+
+      const user = { id: result.insertId, name, email, role };
+      await logAction(user.id, 'REGISTER', 'user', user.id, { role }, req.ip);
+      res.status(201).json({ token: signToken(user), user });
+    } catch (err) {
+      if (inTransaction) await conn.rollback();
+      if (err.code === 'ER_DUP_ENTRY' && !err.status) {
+        err.status = 409;
+        err.message = 'This email is already registered.';
+      }
+      next(err);
+    } finally {
+      if (conn) await conn.release();
+      if (releaseRegistrationLock) releaseRegistrationLock();
+    }
+  }
+);
+
 // Admin-only: create a user
 app.post(
   '/api/auth/register',
@@ -243,17 +381,20 @@ app.post(
   body('password')
     .isStrongPassword({ minLength: 8, minLowercase: 1, minUppercase: 1, minNumbers: 1, minSymbols: 1 })
     .withMessage('Password must be 8+ characters with uppercase, lowercase, number and symbol.'),
-  body('role').isIn(['ADMIN', 'MANAGER', 'CASHIER', 'STAFF']).withMessage('Please select a valid role.'),
+  body('role').isIn(['MANAGER', 'CASHIER', 'STAFF']).withMessage('Admins can assign Manager, Cashier, or Staff roles.'),
   validate,
   async (req, res, next) => {
     try {
       const { name, email, password, role } = req.body;
+      if (email === req.user.email) {
+        return res.status(409).json({ message: 'You cannot change your own role.' });
+      }
       const [[roleRow]] = await pool.query('SELECT id FROM roles WHERE name = ?', [role]);
       const [dup] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
       if (dup[0]) return res.status(409).json({ message: 'This email is already registered.' });
       const hash = await bcrypt.hash(password, 10);
       const [result] = await pool.query(
-        'INSERT INTO users (name, email, password_hash, role_id) VALUES (?,?,?,?)',
+        'INSERT INTO users (name, email, password_hash, role_id, is_active) VALUES (?,?,?,?,1)',
         [name, email, hash, roleRow.id]
       );
       await logAction(req.user.id, 'CREATE', 'user', result.insertId, { email, role }, req.ip);
@@ -356,7 +497,7 @@ async function withTransaction(fn) {
 
 // EVERY stock change goes through here: updates stock, blocks negatives, records a transaction
 async function changeStock(conn, productId, change, type, userId, note, refType = null, refId = null) {
-  const [[p]] = await conn.query('SELECT current_stock FROM products WHERE id = ?', [productId]);
+  const [[p]] = await conn.query(`SELECT current_stock FROM products WHERE id = ?${useMysql ? ' FOR UPDATE' : ''}`, [productId]);
   if (!p) throw httpError(400, 'Invalid product ID.');
   const after = p.current_stock + change;
   if (after < 0) throw httpError(400, 'Quantity cannot be greater than available stock.');
@@ -373,7 +514,7 @@ async function changeStock(conn, productId, change, type, userId, note, refType 
 async function syncAlerts() {
   const [rows] = await pool.query(
      `SELECT id, name, current_stock, min_stock_level,
-       CAST(julianday(expiry_date) - julianday(date('now','localtime')) AS INTEGER) AS days_left
+       ${DAYS_LEFT_SQL('expiry_date')} AS days_left
      FROM products WHERE status = 'ACTIVE'`
   );
   for (const p of rows) {
@@ -401,8 +542,6 @@ async function syncAlerts() {
     }
   }
 }
-if (process.argv[2] !== 'seed') setTimeout(() => syncAlerts().catch((e) => console.error('Alert sync failed:', e.message)), 1000);
-
 // ---------- Image upload (type + size validated) ----------
 const uploadDir = path.join(__dirname, 'uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
@@ -478,7 +617,7 @@ mountCrud('suppliers', 'suppliers',
 
 // ---------- Products ----------
 const PRODUCT_SELECT = `SELECT p.*, c.name AS category_name, s.name AS supplier_name,
-  CAST(julianday(p.expiry_date) - julianday(date('now','localtime')) AS INTEGER) AS days_left
+  ${DAYS_LEFT_SQL('p.expiry_date')} AS days_left
   FROM products p JOIN categories c ON c.id = p.category_id LEFT JOIN suppliers s ON s.id = p.supplier_id`;
 
 const productRules = [
@@ -496,6 +635,24 @@ const productRules = [
 ];
 const productDup = { sku: 'This SKU already exists.', barcode: 'This barcode already exists.' };
 
+app.get('/api/products/scan/:barcode', authenticate, wrap(async (req, res) => {
+  const barcode = String(req.params.barcode || '').trim();
+  if (!barcode || barcode.length > 50) throw httpError(400, 'Enter a valid product barcode.');
+
+  const [rows] = await pool.query(`${PRODUCT_SELECT} WHERE p.barcode = ? LIMIT 1`, [barcode]);
+  if (rows[0]) return res.json({ product: rows[0], catalog: null });
+  if (!isSupportedBarcode(barcode)) {
+    throw httpError(400, 'This barcode is not in your products and is not a supported product barcode for catalog lookup.');
+  }
+
+  try {
+    res.json({ product: null, catalog: await lookupBarcode(barcode) });
+  } catch (err) {
+    if (err.status === 502) throw err;
+    throw httpError(502, 'The barcode catalog could not be reached. You can still add the product manually.');
+  }
+}));
+
 app.get('/api/products', authenticate, wrap(async (req, res) => {
   const { search, category_id, supplier_id, status, alert, sort = 'name', dir = 'asc' } = req.query;
   const page = Math.max(parseInt(req.query.page) || 1, 1);
@@ -508,7 +665,7 @@ app.get('/api/products', authenticate, wrap(async (req, res) => {
   if (status) { where.push('p.status = ?'); args.push(status); }
   if (alert === 'low') where.push('(p.current_stock > 0 AND p.current_stock <= p.min_stock_level)');
   if (alert === 'out') where.push('p.current_stock = 0');
-  if (alert === 'expiring') where.push("(p.expiry_date IS NOT NULL AND p.expiry_date <= date('now','localtime','+30 days'))");
+  if (alert === 'expiring') where.push(`(p.expiry_date IS NOT NULL AND p.expiry_date <= ${NEXT_30_DAYS_SQL})`);
   const sortCols = { name: 'p.name', price: 'p.selling_price', stock: 'p.current_stock', expiry: 'p.expiry_date', created: 'p.created_at' };
   const orderBy = `${sortCols[sort] || 'p.name'} ${dir === 'desc' ? 'DESC' : 'ASC'}`;
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
@@ -526,7 +683,7 @@ app.get('/api/products/low-stock', authenticate, wrap(async (req, res) => {
 app.get('/api/products/expiring', authenticate, wrap(async (req, res) => {
   const [rows] = await pool.query(
     `${PRODUCT_SELECT} WHERE p.status = 'ACTIVE' AND p.expiry_date IS NOT NULL
-    AND p.expiry_date <= date('now','localtime','+30 days') ORDER BY p.expiry_date`);
+    AND p.expiry_date <= ${NEXT_30_DAYS_SQL} ORDER BY p.expiry_date`);
   res.json(rows);
 }));
 
@@ -600,8 +757,8 @@ app.get('/api/inventory', authenticate, wrap(async (req, res) => {
       COALESCE(SUM(current_stock * selling_price), 0) AS retail_value,
       COALESCE(SUM(current_stock > 0 AND current_stock <= min_stock_level), 0) AS low_stock,
       COALESCE(SUM(current_stock = 0), 0) AS out_of_stock,
-      COALESCE(SUM(expiry_date IS NOT NULL AND expiry_date >= date('now','localtime') AND expiry_date <= date('now','localtime','+30 days')), 0) AS expiring,
-      COALESCE(SUM(expiry_date IS NOT NULL AND expiry_date < date('now','localtime')), 0) AS expired
+      COALESCE(SUM(expiry_date IS NOT NULL AND expiry_date >= ${TODAY_SQL} AND expiry_date <= ${NEXT_30_DAYS_SQL}), 0) AS expiring,
+      COALESCE(SUM(expiry_date IS NOT NULL AND expiry_date < ${TODAY_SQL}), 0) AS expired
      FROM products WHERE status = 'ACTIVE'`
   );
   res.json(s);
@@ -644,6 +801,75 @@ app.post('/api/inventory/adjustment', authenticate, authorize('ADMIN', 'MANAGER'
   })
 );
 
+app.post('/api/inventory/receive', authenticate, authorize('ADMIN', 'MANAGER', 'STAFF'),
+  [
+    body('barcode').trim().notEmpty().isLength({ max: 50 }).withMessage('Enter a valid product barcode.'),
+    body('quantity').isInt({ min: 1, max: 1000000 }).withMessage('Received quantity must be between 1 and 1,000,000.'),
+    body('expiry_date').optional({ values: 'falsy' }).isISO8601().withMessage('Please enter a valid expiry date.'),
+  ],
+  validate,
+  wrap(async (req, res) => {
+    const barcode = req.body.barcode.trim();
+    const quantity = Number(req.body.quantity);
+    const expiryDate = emptyToNull(req.body.expiry_date);
+    const stock = await withTransaction(async (conn) => {
+      const [[product]] = await conn.query('SELECT id, status FROM products WHERE barcode = ?', [barcode]);
+      if (!product) throw httpError(404, 'Product not found. Scan it again to add it as a new product.');
+      if (product.status !== 'ACTIVE') throw httpError(409, 'This product is inactive. Activate it before receiving stock.');
+
+      const after = await changeStock(conn, product.id, quantity, 'PURCHASE', req.user.id, 'Received by barcode scan');
+      if (expiryDate) {
+        await conn.query(
+          `UPDATE products SET expiry_date = CASE
+             WHEN expiry_date IS NULL OR expiry_date > ? THEN ? ELSE expiry_date END
+           WHERE id = ?`,
+          [expiryDate, expiryDate, product.id]
+        );
+      }
+      return { productId: product.id, after };
+    });
+
+    await logAction(req.user.id, 'RECEIVE_STOCK', 'product', stock.productId,
+      { barcode, quantity, expiry_date: expiryDate }, req.ip);
+    await syncAlerts();
+    res.json({ message: `Received ${quantity} unit(s). New stock: ${stock.after}.`, stock: stock.after });
+  })
+);
+
+app.post('/api/inventory/receive-new', authenticate, authorize(...MANAGERS),
+  [
+    ...productRules,
+    body('barcode').trim().notEmpty().isLength({ max: 50 }).withMessage('Enter a valid product barcode.'),
+    body('quantity').isInt({ min: 1, max: 1000000 }).withMessage('Received quantity must be between 1 and 1,000,000.'),
+  ],
+  validate,
+  wrap(async (req, res) => {
+    const b = req.body;
+    const barcode = b.barcode.trim();
+    const quantity = Number(b.quantity);
+    const productId = await withTransaction(async (conn) => {
+      const [[existing]] = await conn.query('SELECT id FROM products WHERE barcode = ?', [barcode]);
+      if (existing) throw httpError(409, 'A product with this barcode already exists. Scan it again to receive stock.');
+
+      const [result] = await conn.query(
+        `INSERT INTO products (name, sku, barcode, category_id, supplier_id, brand, description,
+          purchase_price, selling_price, tax_percentage, current_stock, min_stock_level, reorder_quantity, expiry_date)
+         VALUES (?,?,?,?,?,?,?,?,?, ?,0,?,?,?)`,
+        [b.name, b.sku, barcode, b.category_id, emptyToNull(b.supplier_id), emptyToNull(b.brand),
+          emptyToNull(b.description), b.purchase_price, b.selling_price, b.tax_percentage || 0,
+          b.min_stock_level || 5, b.reorder_quantity || 10, emptyToNull(b.expiry_date)]
+      );
+      await changeStock(conn, result.insertId, quantity, 'PURCHASE', req.user.id, 'Received by barcode scan');
+      return result.insertId;
+    }).catch((err) => dbError(err, productDup));
+
+    await logAction(req.user.id, 'CREATE', 'product', productId, { sku: b.sku, barcode }, req.ip);
+    await logAction(req.user.id, 'RECEIVE_STOCK', 'product', productId, { barcode, quantity }, req.ip);
+    await syncAlerts();
+    res.status(201).json({ message: `Product created and ${quantity} unit(s) received.`, id: productId, stock: quantity });
+  })
+);
+
 // ---------- Notifications ----------
 app.get('/api/notifications', authenticate, wrap(async (req, res) => {
   const [items] = await pool.query('SELECT * FROM notifications ORDER BY is_read, id DESC LIMIT 50');
@@ -669,39 +895,39 @@ app.get('/api/dashboard', authenticate, authorize(...MANAGERS), wrap(async (req,
      FROM products WHERE status = 'ACTIVE'`
   );
 
-  // Sales vs purchases for the last 7 months (months with no data show as 0)
+  // Sample seed invoices are excluded so charts only reflect recorded business sales.
   const [salesRows] = await pool.query(
-    `SELECT strftime('%Y-%m', created_at) AS ym, SUM(final_amount) AS total
-     FROM sales
-     WHERE status <> 'RETURNED' AND created_at >= date('now','localtime','start of month','-6 months')
+    `SELECT ${MONTH_FORMAT_SQL('s.created_at')} AS ym,
+       SUM(s.final_amount) AS sales,
+       CASE WHEN SUM(CASE WHEN NOT EXISTS
+         (SELECT 1 FROM sale_items missing WHERE missing.sale_id = s.id) THEN 1 ELSE 0 END) > 0 THEN NULL
+       ELSE SUM(CASE WHEN s.subtotal > 0 THEN
+         (s.subtotal - s.discount) *
+         (SELECT COALESCE(SUM((si.unit_price - si.cost_price) *
+           (si.quantity - si.returned_quantity)), 0)
+          FROM sale_items si WHERE si.sale_id = s.id) / s.subtotal
+         ELSE 0 END) END AS gross_profit
+     FROM sales s
+     WHERE s.status <> 'RETURNED' AND s.invoice_number NOT LIKE 'INV-DEMO-%'
+       AND s.created_at >= ${SIX_MONTHS_AGO_SQL}
      GROUP BY ym`
   );
-  const [purchaseRows] = await pool.query(
-    `SELECT strftime('%Y-%m', purchase_date) AS ym, SUM(total_amount) AS total
-     FROM purchases
-     WHERE purchase_date >= date('now','localtime','start of month','-6 months')
-     GROUP BY ym`
-  );
-  const salesBy = Object.fromEntries(salesRows.map((r) => [r.ym, Number(r.total)]));
-  const purchasesBy = Object.fromEntries(purchaseRows.map((r) => [r.ym, Number(r.total)]));
+  const salesBy = Object.fromEntries(salesRows.map((r) => [r.ym, {
+    sales: Number(r.sales),
+    grossProfit: r.gross_profit === null ? null : Number(r.gross_profit),
+  }]));
   const months = [];
   const now = new Date();
   for (let i = 6; i >= 0; i -= 1) {
     const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
     const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    const monthSales = salesBy[ym];
     months.push({
       month: d.toLocaleString('en-US', { month: 'short' }).toUpperCase(),
-      sales: salesBy[ym] || 0,
-      purchases: purchasesBy[ym] || 0,
+      sales: monthSales?.sales || 0,
+      gross_profit: monthSales ? monthSales.grossProfit : 0,
     });
   }
-
-  const [brands] = await pool.query(
-    `SELECT COALESCE(NULLIF(p.brand, ''), 'Unbranded') AS brand, SUM(si.quantity - si.returned_quantity) AS qty
-     FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN products p ON p.id = si.product_id
-     WHERE s.status <> 'RETURNED'
-     GROUP BY brand HAVING qty > 0 ORDER BY qty DESC LIMIT 4`
-  );
 
   const [lowStock] = await pool.query(
     `SELECT id, sku, name, min_stock_level, current_stock FROM products
@@ -713,13 +939,29 @@ app.get('/api/dashboard', authenticate, authorize(...MANAGERS), wrap(async (req,
     `SELECT p.id, p.name, p.selling_price, p.current_stock AS remaining_qty,
        SUM(si.quantity - si.returned_quantity) AS sold_qty
      FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN products p ON p.id = si.product_id
-     WHERE s.status <> 'RETURNED'
+     WHERE s.status <> 'RETURNED' AND s.invoice_number NOT LIKE 'INV-DEMO-%'
      GROUP BY p.id, p.name, p.selling_price, p.current_stock HAVING sold_qty > 0
-     ORDER BY sold_qty DESC LIMIT 5`
+     ORDER BY sold_qty DESC, p.name ASC LIMIT 5`
   );
 
-  res.json({ ...totals, months, brands, lowStock, topSelling });
+  res.json({
+    ...totals,
+    months,
+    hasSales: months.some((month) => month.sales > 0),
+    topSelling,
+    lowStock,
+  });
 }));
+
+const clientDist = path.resolve(__dirname, '..', 'client', 'dist');
+if (fs.existsSync(path.join(clientDist, 'index.html'))) {
+  app.use(express.static(clientDist));
+  app.get(/^(?!\/api(?:\/|$)|\/uploads(?:\/|$)).*/, (req, res, next) => {
+    res.sendFile(path.join(clientDist, 'index.html'), (err) => {
+      if (err) next(err);
+    });
+  });
+}
 
 // ---------- Errors ----------
 app.use((req, res) => res.status(404).json({ message: 'Route not found.' }));
@@ -970,9 +1212,11 @@ async function seed() {
     let n = 0;
     for (const [name, sku, cat, si, brand, buy, sell, tax, stock, min, days] of prods) {
       n += 1;
-      const expiry = days === null ? 'NULL' : "date('now','localtime',?)";
+      const expiry = days === null
+        ? 'NULL'
+        : useMysql ? 'DATE_ADD(CURDATE(), INTERVAL ? DAY)' : "date('now','localtime',?)";
       const args = [name, sku, `890100${String(n).padStart(4, '0')}`, catId[cat], supId[sups[si][3]], brand, buy, sell, tax, min, min * 3];
-      if (days !== null) args.push(`${days >= 0 ? '+' : ''}${days} days`);
+      if (days !== null) args.push(useMysql ? days : `${days >= 0 ? '+' : ''}${days} days`);
       const [r] = await pool.query(
         `INSERT OR IGNORE INTO products (name, sku, barcode, category_id, supplier_id, brand, purchase_price, selling_price,
           tax_percentage, current_stock, min_stock_level, reorder_quantity, expiry_date)
@@ -1042,9 +1286,23 @@ async function seed() {
   }
 }
 
-if (process.argv[2] === 'seed') {
-  seed();
-} else {
+async function start() {
+  if (process.argv[2] === 'seed') {
+    console.error('Demo data seeding is disabled. Add real business data through SmartBiz.');
+    process.exitCode = 1;
+    return;
+  }
+  await initializeDatabase();
   const PORT = process.env.PORT || 5000;
-  app.listen(PORT, () => console.log(`SmartBiz API running on http://localhost:${PORT}`));
+  app.listen(PORT, () => {
+    console.log(`SmartBiz API running on port ${PORT} using ${useMysql ? 'Aiven/MySQL' : 'SQLite'}`);
+    setTimeout(() => syncAlerts().catch((err) => console.error('Alert sync failed:', err.message)), 1000);
+  });
 }
+
+start().catch((err) => {
+  console.error('Database startup failed:', err.message);
+  pool.end()
+    .catch((closeError) => console.error('Database shutdown failed:', closeError.message))
+    .finally(() => { process.exitCode = 1; });
+});

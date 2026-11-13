@@ -1,14 +1,12 @@
 -- SmartBiz schema (MySQL 8+)
-CREATE DATABASE IF NOT EXISTS smartbiz CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-USE smartbiz;
 
-CREATE TABLE roles (
+CREATE TABLE IF NOT EXISTS roles (
   id TINYINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   name ENUM('ADMIN','MANAGER','CASHIER','STAFF') NOT NULL UNIQUE
 ) ENGINE=InnoDB;
-INSERT INTO roles (name) VALUES ('ADMIN'),('MANAGER'),('CASHIER'),('STAFF');
+INSERT IGNORE INTO roles (name) VALUES ('ADMIN'),('MANAGER'),('CASHIER'),('STAFF');
 
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   name VARCHAR(100) NOT NULL,
   email VARCHAR(150) NOT NULL UNIQUE,
@@ -20,7 +18,7 @@ CREATE TABLE users (
   FOREIGN KEY (role_id) REFERENCES roles(id)
 ) ENGINE=InnoDB;
 
-CREATE TABLE categories (
+CREATE TABLE IF NOT EXISTS categories (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   name VARCHAR(100) NOT NULL UNIQUE,
   description VARCHAR(255),
@@ -28,7 +26,7 @@ CREATE TABLE categories (
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
 
-CREATE TABLE suppliers (
+CREATE TABLE IF NOT EXISTS suppliers (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   name VARCHAR(100) NOT NULL,
   company_name VARCHAR(150),
@@ -42,7 +40,7 @@ CREATE TABLE suppliers (
   INDEX idx_suppliers_name (name)
 ) ENGINE=InnoDB;
 
-CREATE TABLE customers (
+CREATE TABLE IF NOT EXISTS customers (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   name VARCHAR(100) NOT NULL,
   phone VARCHAR(20) NOT NULL,
@@ -54,7 +52,7 @@ CREATE TABLE customers (
   INDEX idx_customers_phone (phone)
 ) ENGINE=InnoDB;
 
-CREATE TABLE products (
+CREATE TABLE IF NOT EXISTS products (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   name VARCHAR(150) NOT NULL,
   sku VARCHAR(50) NOT NULL UNIQUE,
@@ -80,7 +78,7 @@ CREATE TABLE products (
   INDEX idx_products_expiry (expiry_date)
 ) ENGINE=InnoDB;
 
-CREATE TABLE purchases (
+CREATE TABLE IF NOT EXISTS purchases (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   invoice_number VARCHAR(50) NOT NULL UNIQUE,
   supplier_id INT UNSIGNED NOT NULL,
@@ -100,7 +98,7 @@ CREATE TABLE purchases (
   INDEX idx_purchases_date (purchase_date)
 ) ENGINE=InnoDB;
 
-CREATE TABLE purchase_items (
+CREATE TABLE IF NOT EXISTS purchase_items (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   purchase_id INT UNSIGNED NOT NULL,
   product_id INT UNSIGNED NOT NULL,
@@ -112,7 +110,7 @@ CREATE TABLE purchase_items (
   FOREIGN KEY (product_id) REFERENCES products(id)
 ) ENGINE=InnoDB;
 
-CREATE TABLE sales (
+CREATE TABLE IF NOT EXISTS sales (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   invoice_number VARCHAR(50) NOT NULL UNIQUE,
   customer_id INT UNSIGNED,
@@ -132,7 +130,7 @@ CREATE TABLE sales (
   INDEX idx_sales_date (created_at)
 ) ENGINE=InnoDB;
 
-CREATE TABLE sale_items (
+CREATE TABLE IF NOT EXISTS sale_items (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   sale_id INT UNSIGNED NOT NULL,
   product_id INT UNSIGNED NOT NULL,
@@ -146,7 +144,7 @@ CREATE TABLE sale_items (
   FOREIGN KEY (product_id) REFERENCES products(id)
 ) ENGINE=InnoDB;
 
-CREATE TABLE payments (
+CREATE TABLE IF NOT EXISTS payments (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   sale_id INT UNSIGNED,
   purchase_id INT UNSIGNED,
@@ -157,7 +155,7 @@ CREATE TABLE payments (
   FOREIGN KEY (purchase_id) REFERENCES purchases(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
-CREATE TABLE returns (
+CREATE TABLE IF NOT EXISTS returns (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   sale_id INT UNSIGNED NOT NULL,
   processed_by INT UNSIGNED NOT NULL,
@@ -169,7 +167,7 @@ CREATE TABLE returns (
   FOREIGN KEY (processed_by) REFERENCES users(id)
 ) ENGINE=InnoDB;
 
-CREATE TABLE return_items (
+CREATE TABLE IF NOT EXISTS return_items (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   return_id INT UNSIGNED NOT NULL,
   sale_item_id INT UNSIGNED NOT NULL,
@@ -181,7 +179,7 @@ CREATE TABLE return_items (
   FOREIGN KEY (product_id) REFERENCES products(id)
 ) ENGINE=InnoDB;
 
-CREATE TABLE stock_transactions (
+CREATE TABLE IF NOT EXISTS stock_transactions (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   product_id INT UNSIGNED NOT NULL,
   type ENUM('PURCHASE','SALE','RETURN','DAMAGE','MANUAL_ADJUSTMENT') NOT NULL,
@@ -197,7 +195,7 @@ CREATE TABLE stock_transactions (
   INDEX idx_stock_tx_product (product_id, created_at)
 ) ENGINE=InnoDB;
 
-CREATE TABLE notifications (
+CREATE TABLE IF NOT EXISTS notifications (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   type ENUM('LOW_STOCK','OUT_OF_STOCK','EXPIRING','EXPIRED','SUPPLIER_PAYMENT','ACTION_REQUIRED','INFO') NOT NULL,
   severity ENUM('CRITICAL','WARNING','NORMAL','INFO') NOT NULL DEFAULT 'INFO',
@@ -209,7 +207,7 @@ CREATE TABLE notifications (
   INDEX idx_notif_read (is_read, created_at)
 ) ENGINE=InnoDB;
 
-CREATE TABLE audit_logs (
+CREATE TABLE IF NOT EXISTS audit_logs (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   user_id INT UNSIGNED,
   action VARCHAR(50) NOT NULL,

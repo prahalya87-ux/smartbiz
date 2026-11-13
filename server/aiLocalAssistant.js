@@ -62,7 +62,7 @@ const WEBSITE_KNOWLEDGE = [
   },
   {
     match: /\b(what is on|what does .* show|who can see|explain) (the )?(smartbiz )?(dashboard|reports?)\b/i,
-    answer: 'The Dashboard is available to Admins and Managers and shows inventory totals, stock alerts, sales and purchase history, and top-selling summaries based on records in SmartBiz.',
+    answer: 'The Dashboard is available to Admins and Managers and shows inventory totals, stock alerts, recorded sales and gross profit, and top-selling products. Charts remain empty until real sales are recorded.',
   },
 ];
 

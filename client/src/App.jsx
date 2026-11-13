@@ -3,14 +3,16 @@ import ReactDOM from 'react-dom/client';
 import { BrowserRouter, Link, Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import axios from 'axios';
 import { Bar, Pie } from 'react-chartjs-2';
-import { ArcElement, BarElement, CategoryScale, Chart as ChartJS, Legend, LinearScale, Tooltip } from 'chart.js';
+import { ArcElement, BarController, BarElement, CategoryScale, Chart as ChartJS, Legend, LinearScale, PieController, Tooltip } from 'chart.js';
 import { ToastContainer, toast } from 'react-toastify';
 import 'bootstrap/dist/css/bootstrap.min.css';
 import 'bootstrap-icons/font/bootstrap-icons.css';
 import 'react-toastify/dist/ReactToastify.css';
 
 // ---------- API helper ----------
-const api = axios.create({ baseURL: import.meta.env.VITE_API_URL || 'http://localhost:5000/api' });
+const api = axios.create({
+  baseURL: import.meta.env.VITE_API_URL || (import.meta.env.DEV ? 'http://localhost:5000/api' : '/api'),
+});
 
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('token');
@@ -21,8 +23,8 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (res) => res,
   (err) => {
-    const isLoginCall = err.config?.url?.includes('/auth/login');
-    if (err.response?.status === 401 && !isLoginCall) {
+    const isAuthCall = /\/auth\/(login|signup)$/.test(err.config?.url || '');
+    if (err.response?.status === 401 && !isAuthCall) {
       localStorage.removeItem('token');
       if (window.location.pathname !== '/login') window.location.href = '/login';
     }
@@ -59,6 +61,13 @@ function AuthProvider({ children }) {
     return res.data.user;
   };
 
+  const signup = async (name, email, password) => {
+    const res = await api.post('/auth/signup', { name, email, password });
+    localStorage.setItem('token', res.data.token);
+    setUser(res.data.user);
+    return res.data.user;
+  };
+
   const logout = async () => {
     try {
       await api.post('/auth/logout');
@@ -69,7 +78,7 @@ function AuthProvider({ children }) {
     setUser(null);
   };
 
-  return <AuthContext.Provider value={{ user, loading, login, logout }}>{children}</AuthContext.Provider>;
+  return <AuthContext.Provider value={{ user, loading, login, signup, logout }}>{children}</AuthContext.Provider>;
 }
 
 // ---------- Route protection ----------
@@ -91,7 +100,7 @@ function ProtectedRoute({ roles, children }) {
   return children;
 }
 
-// ---------- Login + Forgot password ----------
+// ---------- Login ----------
 function Login() {
   const { user, login } = useAuth();
   const navigate = useNavigate();
@@ -123,7 +132,7 @@ function Login() {
         <div className="text-center mb-4">
           <i className="bi bi-box-seam fs-1 text-primary" aria-hidden="true"></i>
           <h1 className="h4 mt-2 mb-0">SmartBiz</h1>
-          <p className="text-secondary small">Digital Inventory and Sales Management</p>
+          <p className="text-secondary small">Inventory, sales &amp; business insights</p>
         </div>
         <form onSubmit={handleSubmit}>
           <div className="mb-3">
@@ -139,33 +148,83 @@ function Login() {
           <button className="btn btn-primary w-100" disabled={submitting}>
             {submitting ? 'Signing in...' : 'Sign in'}
           </button>
-          <div className="text-center mt-3">
-            <Link to="/forgot-password" className="small">Forgot password?</Link>
-          </div>
         </form>
-        <div className="alert alert-warning small mt-4 mb-0">
-          <strong>Development-only demo logins</strong> (never use in production)
-          <ul className="mb-0 ps-3">
-            <li>admin@smartbiz.com / Admin@123</li>
-            <li>manager@smartbiz.com / Manager@123</li>
-            <li>cashier@smartbiz.com / Cashier@123</li>
-            <li>staff@smartbiz.com / Staff@123</li>
-          </ul>
-        </div>
+        <p className="text-center text-secondary small mt-3 mb-0">
+          New to SmartBiz? <Link to="/register">Create an account</Link>
+        </p>
       </div>
     </div>
   );
 }
 
-function ForgotPassword() {
+function Register() {
+  const { user, signup } = useAuth();
+  const navigate = useNavigate();
+  const [form, setForm] = useState({ name: '', email: '', password: '', confirmPassword: '' });
+  const [submitting, setSubmitting] = useState(false);
+
+  if (user) return <Navigate to="/dashboard" replace />;
+
+  const handleChange = (event) => setForm({ ...form, [event.target.name]: event.target.value });
+
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+    if (form.password !== form.confirmPassword) {
+      toast.error('Passwords do not match.');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const newUser = await signup(form.name, form.email, form.password);
+      toast.success(`Welcome to SmartBiz, ${newUser.name}!`);
+      navigate('/dashboard', { replace: true });
+    } catch (err) {
+      toast.error(getErrorMessage(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   return (
-    <div className="container d-flex align-items-center justify-content-center min-vh-100">
-      <div className="card p-4 text-center shadow-sm" style={{ maxWidth: 420, width: '100%' }}>
-        <h1 className="h5">Forgot password</h1>
-        <p className="text-secondary">
-          Email-based password reset is <strong>coming soon</strong>. For now, ask your administrator to reset your password.
+    <div className="container d-flex align-items-center justify-content-center min-vh-100 py-4">
+      <div className="card p-4 shadow-sm" style={{ maxWidth: 460, width: '100%' }}>
+        <div className="text-center mb-4">
+          <i className="bi bi-box-seam fs-1 text-primary" aria-hidden="true"></i>
+          <h1 className="h4 mt-2 mb-0">Create your SmartBiz account</h1>
+          <p className="text-secondary small mb-0">Get started managing your shop</p>
+        </div>
+        <form onSubmit={handleSubmit}>
+          <div className="mb-3">
+            <label htmlFor="register-name" className="form-label">Full name</label>
+            <input id="register-name" name="name" type="text" className="form-control" required maxLength={100}
+              autoComplete="name" autoFocus value={form.name} onChange={handleChange} />
+          </div>
+          <div className="mb-3">
+            <label htmlFor="register-email" className="form-label">Email</label>
+            <input id="register-email" name="email" type="email" className="form-control" required maxLength={150}
+              autoComplete="email" value={form.email} onChange={handleChange} />
+          </div>
+          <div className="mb-3">
+            <label htmlFor="register-password" className="form-label">Password</label>
+            <input id="register-password" name="password" type="password" className="form-control" required minLength={8}
+              autoComplete="new-password" value={form.password} onChange={handleChange} />
+            <div className="form-text">Use at least 8 characters with uppercase, lowercase, a number, and a symbol.</div>
+          </div>
+          <div className="mb-3">
+            <label htmlFor="register-confirm-password" className="form-label">Confirm password</label>
+            <input id="register-confirm-password" name="confirmPassword" type="password" className="form-control" required
+              autoComplete="new-password" value={form.confirmPassword} onChange={handleChange} />
+          </div>
+          <div className="alert alert-light border small">
+            The first account for a shop becomes Admin. Later accounts receive Staff access. Accounts are active immediately.
+          </div>
+          <button className="btn btn-primary w-100" disabled={submitting}>
+            {submitting ? 'Creating account...' : 'Create account'}
+          </button>
+        </form>
+        <p className="text-center text-secondary small mt-3 mb-0">
+          Already have an account? <Link to="/login">Sign in</Link>
         </p>
-        <Link to="/login" className="btn btn-primary">Back to sign in</Link>
       </div>
     </div>
   );
@@ -174,6 +233,7 @@ function ForgotPassword() {
 // ---------- Shared UI helpers ----------
 const API_ORIGIN = (api.defaults.baseURL || '').replace(/\/api\/?$/, '');
 const MANAGERS = ['ADMIN', 'MANAGER'];
+const ADMINS = ['ADMIN'];
 const money = (n) => `₹${Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const fmtDate = (d) => (d ? String(d).slice(0, 10).split('-').reverse().join('/') : '-');
 
@@ -294,24 +354,24 @@ const SEVERITY = { CRITICAL: ['danger', 'Critical'], WARNING: ['orange', 'Warnin
 // ---------- Layout: sidebar + top bar + breadcrumb ----------
 const NAV = [
   { to: '/dashboard', label: 'Dashboard', icon: 'speedometer2' },
+  { to: '/assistant', label: 'AI Assistant', icon: 'stars' },
   { to: '/products', label: 'Products', icon: 'box-seam' },
   { to: '/categories', label: 'Categories', icon: 'tags', roles: MANAGERS },
   { to: '/suppliers', label: 'Suppliers', icon: 'truck', roles: MANAGERS },
+  { to: '/team', label: 'Team', icon: 'people', roles: ADMINS },
   { to: '/inventory', label: 'Inventory', icon: 'clipboard-data' },
   { to: '/notifications', label: 'Notifications', icon: 'bell' },
 ];
 
 const AI_SUGGESTIONS = [
   'Which products are low in stock?',
-  "Show today's sales.",
+  "Show this month's sales.",
   'Which products are selling the most?',
-  'Predict my sales.',
-  'Which products should I reorder?',
+  'Which products are expiring soon?',
+  'Compare this month with last month.',
 ];
 
 function SmartBizAssistant() {
-  const [isOpen, setIsOpen] = useState(false);
-  const [isMinimized, setIsMinimized] = useState(false);
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -325,7 +385,7 @@ function SmartBizAssistant() {
     if (conversationRef.current) {
       conversationRef.current.scrollTop = conversationRef.current.scrollHeight;
     }
-  }, [messages, isLoading, error, isOpen, isMinimized]);
+  }, [messages, isLoading, error]);
 
   const startNewConversation = () => {
     requestId.current += 1;
@@ -391,118 +451,92 @@ function SmartBizAssistant() {
     }
   };
 
-  const openAssistant = () => {
-    setIsOpen(true);
-    setIsMinimized(false);
-  };
-
   return (
     <>
-      {isOpen && !isMinimized && (
-        <section className="sb-ai-panel" aria-label="SmartBiz AI Assistant">
-          <header className="sb-ai-header">
-            <div className="d-flex align-items-center gap-2">
-              <span className="sb-ai-header-icon" aria-hidden="true"><i className="bi bi-stars"></i></span>
-              <div>
-                <h2 className="sb-ai-title">SmartBiz AI Assistant</h2>
-                <span className="sb-ai-subtitle">Here to help with your business</span>
-              </div>
+      <section className="sb-ai-panel" aria-label="SmartBiz AI Assistant">
+        <header className="sb-ai-header">
+          <div className="d-flex align-items-center gap-2">
+            <span className="sb-ai-header-icon" aria-hidden="true"><i className="bi bi-stars"></i></span>
+            <div>
+              <h2 className="sb-ai-title">SmartBiz AI Assistant</h2>
+              <span className="sb-ai-subtitle">Here to help with your business</span>
             </div>
-            <div className="d-flex align-items-center gap-1">
-              <button type="button" className="sb-ai-icon-button" aria-label="New conversation" title="New conversation"
-                onClick={startNewConversation}>
-                <i className="bi bi-plus-lg" aria-hidden="true"></i>
-              </button>
-              <button type="button" className="sb-ai-icon-button" aria-label="Minimize assistant" title="Minimize"
-                onClick={() => setIsMinimized(true)}>
-                <i className="bi bi-dash-lg" aria-hidden="true"></i>
-              </button>
-              <button type="button" className="sb-ai-icon-button" aria-label="Close assistant" title="Close"
-                onClick={() => { setIsOpen(false); setIsMinimized(false); }}>
-                <i className="bi bi-x-lg" aria-hidden="true"></i>
-              </button>
-            </div>
-          </header>
-
-          <div className="sb-ai-conversation" ref={conversationRef} aria-live="polite">
-            {messages.length === 0 ? (
-              <div className="sb-ai-welcome">
-                <div className="sb-ai-welcome-mark" aria-hidden="true"><i className="bi bi-stars"></i></div>
-                <div className="sb-ai-bubble sb-ai-assistant-bubble">
-                  Hi! I'm your SmartBiz AI Assistant. How can I help you manage your business today?
-                </div>
-                <p className="sb-ai-suggestion-label">Try asking</p>
-                <div className="sb-ai-suggestions">
-                  {AI_SUGGESTIONS.map((suggestion) => (
-                    <button key={suggestion} type="button" className="sb-ai-suggestion"
-                      onClick={(event) => sendMessage(event, suggestion)}>
-                      {suggestion}<i className="bi bi-arrow-up-left" aria-hidden="true"></i>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            ) : (
-              <div className="sb-ai-message-list">
-                {messages.map((message) => (
-                  <div className={`sb-ai-message-row ${message.role === 'user' ? 'sb-ai-user-row' : ''}`} key={message.id}>
-                    <div className={`sb-ai-bubble ${message.role === 'user' ? 'sb-ai-user-bubble' : 'sb-ai-assistant-bubble'}`}>
-                      {message.text}
-                    </div>
-                  </div>
-                ))}
-                {isLoading && (
-                  <div className="sb-ai-message-row" role="status" aria-label="Waiting for assistant">
-                    <div className="sb-ai-bubble sb-ai-assistant-bubble sb-ai-loading">
-                      <span></span><span></span><span></span>
-                    </div>
-                  </div>
-                )}
-                {error && (
-                  <div className="sb-ai-error" role="alert">
-                    <i className="bi bi-info-circle" aria-hidden="true"></i>
-                    <span>{error}</span>
-                    <button type="button" className="sb-ai-retry"
-                      onClick={errorRetryable
-                        ? () => sendMessage(null, retryPrompt, true)
-                        : () => { setError(''); setRetryPrompt(''); }}
-                      disabled={isLoading || !retryPrompt}>
-                      {errorRetryable ? 'Retry' : 'Dismiss'}
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
           </div>
+          <button type="button" className="sb-ai-icon-button" aria-label="New conversation" title="New conversation"
+            onClick={startNewConversation}>
+            <i className="bi bi-plus-lg" aria-hidden="true"></i>
+          </button>
+        </header>
 
-          <form className="sb-ai-composer" onSubmit={sendMessage}>
-            <label htmlFor="sb-ai-message" className="visually-hidden">Message SmartBiz AI Assistant</label>
-            <textarea id="sb-ai-message" className="sb-ai-input" rows="1" placeholder="Ask a question..."
-              value={input} maxLength={2000} onChange={(event) => setInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && !event.shiftKey) {
-                  event.preventDefault();
-                  sendMessage(event);
-                }
-              }} />
-            <button type="submit" className="sb-ai-send" disabled={!input.trim() || isLoading} aria-label="Send message">
-              <i className="bi bi-arrow-up" aria-hidden="true"></i>
-            </button>
-            <span className="sb-ai-composer-hint">Enter to send · Shift+Enter for a new line</span>
-          </form>
-        </section>
-      )}
+        <div className="sb-ai-conversation" ref={conversationRef} aria-live="polite">
+          {messages.length === 0 ? (
+            <div className="sb-ai-welcome">
+              <div className="sb-ai-welcome-mark" aria-hidden="true"><i className="bi bi-stars"></i></div>
+              <div className="sb-ai-bubble sb-ai-assistant-bubble">
+                Hi! I'm your SmartBiz AI Assistant. How can I help you manage your business today?
+              </div>
+              <p className="sb-ai-suggestion-label">Try asking</p>
+              <div className="sb-ai-suggestions">
+                {AI_SUGGESTIONS.map((suggestion) => (
+                  <button key={suggestion} type="button" className="sb-ai-suggestion"
+                    onClick={(event) => sendMessage(event, suggestion)}>
+                    {suggestion}<i className="bi bi-arrow-up-left" aria-hidden="true"></i>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="sb-ai-message-list">
+              {messages.map((message) => (
+                <div className={`sb-ai-message-row ${message.role === 'user' ? 'sb-ai-user-row' : ''}`} key={message.id}>
+                  <div className={`sb-ai-bubble ${message.role === 'user' ? 'sb-ai-user-bubble' : 'sb-ai-assistant-bubble'}`}>
+                    {message.text}
+                  </div>
+                </div>
+              ))}
+              {isLoading && (
+                <div className="sb-ai-message-row" role="status" aria-label="Waiting for assistant">
+                  <div className="sb-ai-bubble sb-ai-assistant-bubble sb-ai-loading">
+                    <span></span><span></span><span></span>
+                  </div>
+                </div>
+              )}
+              {error && (
+                <div className="sb-ai-error" role="alert">
+                  <i className="bi bi-info-circle" aria-hidden="true"></i>
+                  <span>{error}</span>
+                  <button type="button" className="sb-ai-retry"
+                    onClick={errorRetryable
+                      ? () => sendMessage(null, retryPrompt, true)
+                      : () => { setError(''); setRetryPrompt(''); }}
+                    disabled={isLoading || !retryPrompt}>
+                    {errorRetryable ? 'Retry' : 'Dismiss'}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
 
-      {(!isOpen || isMinimized) && (
-        <button type="button" className="sb-ai-launcher" onClick={openAssistant}
-          aria-label={isMinimized ? 'Restore SmartBiz AI Assistant' : 'Ask SmartBiz AI'}
-          title="Ask SmartBiz AI" data-tooltip="Ask SmartBiz AI">
-          <i className="bi bi-stars" aria-hidden="true"></i>
-        </button>
-      )}
+        <form className="sb-ai-composer" onSubmit={sendMessage}>
+          <label htmlFor="sb-ai-message" className="visually-hidden">Message SmartBiz AI Assistant</label>
+          <textarea id="sb-ai-message" className="sb-ai-input" rows="1" placeholder="Ask a question..."
+            value={input} maxLength={2000} onChange={(event) => setInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendMessage(event);
+              }
+            }} />
+          <button type="submit" className="sb-ai-send" disabled={!input.trim() || isLoading} aria-label="Send message">
+            <i className="bi bi-arrow-up" aria-hidden="true"></i>
+          </button>
+          <span className="sb-ai-composer-hint">Enter to send · Shift+Enter for a new line</span>
+        </form>
+      </section>
 
       <style>{`
-        .sb-ai-panel,.sb-ai-launcher{font-family:inherit}
-        .sb-ai-panel{position:fixed;z-index:1050;right:24px;bottom:98px;width:min(390px,calc(100vw - 32px));height:min(620px,calc(100dvh - 122px));min-height:360px;display:flex;flex-direction:column;overflow:hidden;background:#fff;border:1px solid #e4eee7;border-radius:18px;box-shadow:0 18px 55px rgba(12,44,27,.2);animation:sb-ai-enter .2s ease-out}
+        .sb-ai-panel{width:100%;height:min(72vh,760px);min-height:480px;display:flex;flex-direction:column;overflow:hidden;background:#fff;border:1px solid #e4eee7;border-radius:18px;box-shadow:0 8px 28px rgba(12,44,27,.08)}
         .sb-ai-header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:14px 14px 14px 16px;color:#fff;background:linear-gradient(120deg,#11623b,#208c55)}
         .sb-ai-header-icon{display:grid;place-items:center;width:36px;height:36px;border-radius:12px;background:rgba(255,255,255,.16);font-size:19px}
         .sb-ai-title{margin:0;font-size:15px;font-weight:650;line-height:1.3}
@@ -539,15 +573,10 @@ function SmartBizAssistant() {
         .sb-ai-send:not(:disabled):hover{background:#10663a;transform:translateY(-1px)}
         .sb-ai-send:disabled{cursor:not-allowed;opacity:.45}
         .sb-ai-composer-hint{position:absolute;bottom:9px;left:16px;color:#87948b;font-size:10px}
-        .sb-ai-launcher{position:fixed;z-index:1051;right:24px;bottom:24px;display:grid;place-items:center;width:58px;height:58px;padding:0;border:1px solid rgba(255,255,255,.4);border-radius:50%;color:#fff;background:linear-gradient(145deg,#239356,#11663b);box-shadow:0 7px 22px rgba(18,110,60,.32),0 0 0 5px rgba(35,147,86,.08);font-size:25px;cursor:pointer;transition:transform .2s ease,box-shadow .2s ease,filter .2s ease}
-        .sb-ai-launcher:hover,.sb-ai-launcher:focus-visible{transform:translateY(-3px) scale(1.04);filter:brightness(1.05);box-shadow:0 11px 28px rgba(18,110,60,.4),0 0 0 7px rgba(35,147,86,.11)}
-        .sb-ai-launcher:focus-visible,.sb-ai-icon-button:focus-visible,.sb-ai-suggestion:focus-visible,.sb-ai-send:focus-visible{outline:3px solid #a5d8b5;outline-offset:2px}
-        .sb-ai-launcher[data-tooltip]:hover:after,.sb-ai-launcher[data-tooltip]:focus-visible:after{position:absolute;right:68px;padding:7px 10px;border-radius:7px;color:#fff;background:#26352b;content:attr(data-tooltip);font-size:12px;font-weight:500;white-space:nowrap;box-shadow:0 3px 10px rgba(0,0,0,.16)}
-        @keyframes sb-ai-enter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+        .sb-ai-icon-button:focus-visible,.sb-ai-suggestion:focus-visible,.sb-ai-send:focus-visible{outline:3px solid #a5d8b5;outline-offset:2px}
         @keyframes sb-ai-dot{0%,60%,100%{opacity:.35;transform:translateY(0)}30%{opacity:1;transform:translateY(-3px)}}
-        @media(max-width:767px){.sb-ai-panel{right:16px;bottom:90px;width:min(390px,calc(100vw - 32px));height:min(620px,calc(100dvh - 108px))}.sb-ai-launcher{right:18px;bottom:18px;width:54px;height:54px}}
-        @media(max-width:420px){.sb-ai-panel{right:10px;bottom:82px;width:calc(100vw - 20px);height:min(620px,calc(100dvh - 96px));min-height:320px;border-radius:15px}.sb-ai-launcher{right:14px;bottom:14px}}
-        @media(prefers-reduced-motion:reduce){.sb-ai-panel,.sb-ai-panel *,.sb-ai-launcher{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+        @media(max-width:767px){.sb-ai-panel{height:calc(100dvh - 240px);min-height:400px}}
+        @media(prefers-reduced-motion:reduce){.sb-ai-panel *{animation-duration:.01ms!important;transition-duration:.01ms!important}}
       `}</style>
     </>
   );
@@ -637,7 +666,6 @@ function Layout() {
           <Outlet />
         </main>
       </div>
-      <SmartBizAssistant />
     </div>
   );
 }
@@ -678,6 +706,12 @@ function BasicDashboard() {
           </div>
         )}
       </DataState>
+      <SalesProfitCharts
+        months={[]}
+        topSelling={[]}
+        hasSales={false}
+        emptyMessage="No sales data is available for this account yet."
+      />
       <div className="card">
         <div className="card-header bg-white fw-semibold">Recent notifications</div>
         <DataState state={notes} isEmpty={notes.data && notes.data.items.length === 0} emptyText="No notifications yet.">
@@ -696,10 +730,87 @@ function BasicDashboard() {
 }
 
 // ---------- Analytics dashboard (Admin / Manager) ----------
-ChartJS.register(CategoryScale, LinearScale, BarElement, ArcElement, Tooltip, Legend);
+ChartJS.register(BarController, PieController, CategoryScale, LinearScale, BarElement, ArcElement, Tooltip, Legend);
 
-const BRAND_COLORS = ['#1e3a8a', '#10b981', '#8b5e3c', '#f97316', '#94a3b8'];
+const CHART_COLORS = ['#1e3a8a', '#10b981', '#8b5e3c', '#f97316', '#94a3b8'];
 const shortMoney = (n) => (n >= 100000 ? `${(n / 100000).toFixed(1)}L` : n >= 1000 ? `${(n / 1000).toFixed(0)}k` : String(n));
+
+function SalesProfitCharts({ months, topSelling, hasSales, emptyMessage = 'No sales recorded yet.' }) {
+  const now = new Date();
+  const labels = months.length
+    ? months.map((month) => month.month)
+    : Array.from({ length: 7 }, (_, index) => {
+      const month = new Date(now.getFullYear(), now.getMonth() - (6 - index), 1);
+      return month.toLocaleString('en-US', { month: 'short' }).toUpperCase();
+    });
+  const performanceData = {
+    labels,
+    datasets: [
+      { label: 'Sales', data: months.length ? months.map((month) => month.sales) : labels.map(() => 0), backgroundColor: '#4f7cf0', borderRadius: 4 },
+      { label: 'Gross profit', data: months.length ? months.map((month) => month.gross_profit) : labels.map(() => 0), backgroundColor: '#10b981', borderRadius: 4 },
+    ],
+  };
+  const productData = {
+    labels: topSelling.map((product) => product.name),
+    datasets: [{
+      data: topSelling.map((product) => Number(product.sold_qty)),
+      backgroundColor: CHART_COLORS,
+      borderWidth: 2,
+      borderColor: '#fff',
+    }],
+  };
+  const salesOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { position: 'top', align: 'start', labels: { usePointStyle: true, boxWidth: 8 } },
+      tooltip: { callbacks: { label: (context) => `${context.dataset.label}: ${money(context.parsed.y)}` } },
+    },
+    scales: {
+      y: { beginAtZero: true, ticks: { callback: (value) => shortMoney(value) }, grid: { color: '#eef1f6' } },
+      x: { grid: { display: false } },
+    },
+  };
+  const productOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: { legend: { position: 'bottom', labels: { usePointStyle: true, boxWidth: 8 } } },
+  };
+
+  return (
+    <div className="row g-3 mb-4">
+      <div className="col-lg-8">
+        <div className="card border-0 shadow-sm h-100 p-3">
+          <div className="fw-semibold mb-2">Sales &amp; Gross Profit <span className="text-secondary small fw-normal">(last 7 months)</span></div>
+          <div className="position-relative" style={{ height: 260 }}>
+            <Bar data={performanceData} options={salesOptions} />
+            {!hasSales && (
+              <span className="position-absolute top-50 start-50 translate-middle text-secondary small text-center bg-white bg-opacity-75 px-2">
+                {emptyMessage}
+              </span>
+            )}
+          </div>
+          {months.some((month) => month.gross_profit === null) && (
+            <p className="small text-secondary mb-0">Gross profit is unavailable for months containing sales without item details.</p>
+          )}
+        </div>
+      </div>
+      <div className="col-lg-4">
+        <div className="card border-0 shadow-sm h-100 p-3">
+          <div className="fw-semibold mb-2">Top-selling products</div>
+          <div className="position-relative" style={{ height: 260 }}>
+            <Pie data={productData} options={productOptions} />
+            {!topSelling.length && (
+              <span className="position-absolute top-50 start-50 translate-middle text-secondary small text-center bg-white bg-opacity-75 px-2">
+                {emptyMessage}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function KpiCard({ label, value, icon, bg, to }) {
   return (
@@ -725,26 +836,6 @@ function AnalyticsDashboard() {
   const dash = useApi('/dashboard');
   const d = dash.data;
 
-  const barData = d && {
-    labels: d.months.map((m) => m.month),
-    datasets: [
-      { label: 'Sales', data: d.months.map((m) => m.sales), backgroundColor: '#4f7cf0', borderRadius: 4 },
-      { label: 'Purchase', data: d.months.map((m) => m.purchases), backgroundColor: '#c9d6fb', borderRadius: 4 },
-    ],
-  };
-  const barOptions = {
-    responsive: true,
-    maintainAspectRatio: false,
-    plugins: { legend: { position: 'top', align: 'start', labels: { usePointStyle: true, boxWidth: 8 } }, tooltip: { callbacks: { label: (c) => `${c.dataset.label}: ${money(c.parsed.y)}` } } },
-    scales: { y: { beginAtZero: true, ticks: { callback: (v) => shortMoney(v) }, grid: { color: '#eef1f6' } }, x: { grid: { display: false } } },
-  };
-
-  const brandTotal = d ? d.brands.reduce((sum, b) => sum + Number(b.qty), 0) : 0;
-  const pieData = d && {
-    labels: d.brands.map((b) => b.brand),
-    datasets: [{ data: d.brands.map((b) => Number(b.qty)), backgroundColor: BRAND_COLORS, borderWidth: 2, borderColor: '#fff' }],
-  };
-
   return (
     <>
       <div className="mb-3">
@@ -761,36 +852,7 @@ function AnalyticsDashboard() {
               <KpiCard label="Out of stock products" value={d.out_of_stock} icon="x-octagon" bg="#dc3545" to="/inventory" />
             </div>
 
-            <div className="row g-3 mb-3">
-              <div className="col-lg-8">
-                <div className="card border-0 shadow-sm h-100 p-3">
-                  <div className="fw-semibold mb-2">Sales &amp; Purchase <span className="text-secondary small fw-normal">(last 7 months)</span></div>
-                  <div style={{ height: 260 }}><Bar data={barData} options={barOptions} /></div>
-                </div>
-              </div>
-              <div className="col-lg-4">
-                <div className="card border-0 shadow-sm h-100 p-3">
-                  <div className="fw-semibold mb-2">Top Selling Brands</div>
-                  {d.brands.length === 0 ? (
-                    <Empty text="No sales yet." />
-                  ) : (
-                    <>
-                      <div style={{ height: 190 }}>
-                        <Pie data={pieData} options={{ responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }} />
-                      </div>
-                      <ul className="list-unstyled small mb-0 mt-3 d-flex flex-wrap gap-3 justify-content-center">
-                        {d.brands.map((b, i) => (
-                          <li key={b.brand}>
-                            <span className="d-inline-block rounded-circle me-1" style={{ width: 9, height: 9, background: BRAND_COLORS[i] }}></span>
-                            {b.brand} ({Math.round((Number(b.qty) / brandTotal) * 100)}%)
-                          </li>
-                        ))}
-                      </ul>
-                    </>
-                  )}
-                </div>
-              </div>
-            </div>
+            <SalesProfitCharts months={d.months} topSelling={d.topSelling} hasSales={d.hasSales} />
 
             <div className="row g-3">
               <div className="col-lg-6">
@@ -1017,6 +1079,66 @@ const Suppliers = () => (
       status: 'ACTIVE',
     }} />
 );
+
+function Team() {
+    const [form, setForm] = useState({ name: '', email: '', password: '', role: 'STAFF' });
+    const [saving, setSaving] = useState(false);
+
+    const handleSubmit = async (event) => {
+      event.preventDefault();
+      setSaving(true);
+      try {
+        await api.post('/auth/register', form);
+        toast.success(`${form.name} was added to your team.`);
+        setForm({ name: '', email: '', password: '', role: 'STAFF' });
+      } catch (err) {
+        toast.error(getErrorMessage(err));
+      } finally {
+        setSaving(false);
+      }
+    };
+
+    return (
+      <>
+        <div className="mb-3">
+          <h1 className="h4 mb-1">Team accounts</h1>
+          <p className="text-secondary mb-0">Create employee accounts and assign their access level.</p>
+        </div>
+        <div className="card border-0 shadow-sm p-3 p-md-4" style={{ maxWidth: 680 }}>
+          <form onSubmit={handleSubmit}>
+            <div className="mb-3">
+              <label htmlFor="team-name" className="form-label">Full name</label>
+              <input id="team-name" className="form-control" value={form.name} maxLength={100} required
+                onChange={(event) => setForm({ ...form, name: event.target.value })} />
+            </div>
+            <div className="mb-3">
+              <label htmlFor="team-email" className="form-label">Email</label>
+              <input id="team-email" type="email" className="form-control" value={form.email} maxLength={150} required
+                onChange={(event) => setForm({ ...form, email: event.target.value })} />
+            </div>
+            <div className="mb-3">
+              <label htmlFor="team-password" className="form-label">Temporary password</label>
+              <input id="team-password" type="password" className="form-control" value={form.password} minLength={8} required
+                onChange={(event) => setForm({ ...form, password: event.target.value })} />
+              <div className="form-text">Use at least 8 characters with uppercase, lowercase, a number, and a symbol.</div>
+            </div>
+            <div className="mb-4">
+              <label htmlFor="team-role" className="form-label">Role</label>
+              <select id="team-role" className="form-select" value={form.role}
+                onChange={(event) => setForm({ ...form, role: event.target.value })}>
+                <option value="STAFF">Staff</option>
+                <option value="CASHIER">Cashier</option>
+                <option value="MANAGER">Manager</option>
+              </select>
+            </div>
+            <button type="submit" className="btn btn-primary" disabled={saving}>
+              {saving ? 'Creating account...' : 'Create employee account'}
+            </button>
+          </form>
+        </div>
+      </>
+    );
+}
 
 // ---------- Products ----------
 const BLANK_PRODUCT = {
@@ -1371,6 +1493,428 @@ function AdjustModal({ onClose, onDone }) {
   );
 }
 
+function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
+  const categories = useApi('/categories');
+  const categoriesRef = useRef(categories.data);
+  categoriesRef.current = categories.data;
+  const barcodeRef = useRef(null);
+  const videoRef = useRef(null);
+  const cameraStreamRef = useRef(null);
+  const cameraControlsRef = useRef(null);
+  const cameraScanHandledRef = useRef(false);
+  const [barcode, setBarcode] = useState('');
+  const [scanned, setScanned] = useState(null);
+  const [quantity, setQuantity] = useState('1');
+  const [expiryDate, setExpiryDate] = useState('');
+  const [productForm, setProductForm] = useState(null);
+  const [newCategoryName, setNewCategoryName] = useState('');
+  const [addingCategory, setAddingCategory] = useState(false);
+  const [scanError, setScanError] = useState('');
+  const [lookingUp, setLookingUp] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [cameraActive, setCameraActive] = useState(false);
+  const [cameraLoading, setCameraLoading] = useState(false);
+  const [cameraError, setCameraError] = useState('');
+
+  useEffect(() => {
+    barcodeRef.current?.focus();
+  }, []);
+
+  const lookupBarcode = useCallback(async (value) => {
+    const code = value.trim();
+    if (!code) return;
+    setLookingUp(true);
+    setScanError('');
+    setScanned(null);
+    setProductForm(null);
+    setExpiryDate('');
+    setNewCategoryName('');
+    try {
+      const { data } = await api.get(`/products/scan/${encodeURIComponent(code)}`);
+      if (data.product) {
+        setScanned({ type: 'existing', product: data.product });
+      } else {
+        const catalog = data.catalog;
+        const knownCategories = categoriesRef.current || [];
+        const match = knownCategories.find((category) => catalog?.categories?.some(
+          (suggestion) => suggestion.toLowerCase() === category.name.toLowerCase()
+        ));
+        setScanned({ type: 'new', catalog });
+        setProductForm({
+          name: catalog?.name || '',
+          sku: `BC-${code}`,
+          category_id: match ? String(match.id) : '',
+          brand: catalog?.brand || '',
+          purchase_price: '',
+          selling_price: '',
+          tax_percentage: '0',
+          min_stock_level: '5',
+          reorder_quantity: '10',
+        });
+        if (!catalog) setScanError('No product details were found in the barcode catalog. Enter the product details below.');
+      }
+    } catch (err) {
+      setScanned({ type: 'new', catalog: null });
+      setProductForm({
+        name: '',
+        sku: `BC-${code}`,
+        category_id: '',
+        brand: '',
+        purchase_price: '',
+        selling_price: '',
+        tax_percentage: '0',
+        min_stock_level: '5',
+        reorder_quantity: '10',
+      });
+      setScanError(`${getErrorMessage(err)} You can still enter the product details manually.`);
+    } finally {
+      setLookingUp(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!cameraActive || !videoRef.current) return undefined;
+    let cancelled = false;
+    const startCameraReader = async () => {
+      let timeoutId;
+      let requestTimedOut = false;
+      let stream;
+      try {
+        const { BrowserMultiFormatReader } = await import('@zxing/browser');
+        if (cancelled) return;
+        const reader = new BrowserMultiFormatReader();
+        const cameraRequest = navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: { ideal: 'environment' } },
+        }).then((mediaStream) => {
+          if (cancelled || requestTimedOut) {
+            mediaStream.getTracks().forEach((track) => track.stop());
+            return null;
+          }
+          return mediaStream;
+        });
+        stream = await Promise.race([
+          cameraRequest,
+          new Promise((_, reject) => {
+            timeoutId = setTimeout(() => {
+              requestTimedOut = true;
+              reject(new Error('CAMERA_PERMISSION_TIMEOUT'));
+            }, 15000);
+          }),
+        ]);
+        if (!stream || cancelled) return;
+        cameraStreamRef.current = stream;
+        const video = videoRef.current;
+        if (!video) throw new Error('CAMERA_PREVIEW_UNAVAILABLE');
+        video.srcObject = stream;
+        await video.play();
+        if (cancelled) return;
+        const videoTrack = stream.getVideoTracks()[0];
+        if (!videoTrack || videoTrack.readyState !== 'live') throw new Error('CAMERA_TRACK_UNAVAILABLE');
+        const controls = await reader.decodeFromVideoElement(
+          video,
+          (result, _error, scanControls) => {
+            if (!result || cameraScanHandledRef.current) return;
+            cameraScanHandledRef.current = true;
+            scanControls.stop();
+            if (cameraControlsRef.current === scanControls) cameraControlsRef.current = null;
+            stream.getTracks().forEach((track) => track.stop());
+            if (cameraStreamRef.current === stream) cameraStreamRef.current = null;
+            if (video.srcObject === stream) video.srcObject = null;
+            setCameraActive(false);
+            const code = result.getText();
+            setBarcode(code);
+            lookupBarcode(code);
+          }
+        );
+        if (cancelled || stream.getTracks().every((track) => track.readyState !== 'live')) {
+          controls.stop();
+          return;
+        }
+        cameraControlsRef.current = controls;
+        setCameraLoading(false);
+      } catch (error) {
+        if (stream) stream.getTracks().forEach((track) => track.stop());
+        if (cameraStreamRef.current === stream) cameraStreamRef.current = null;
+        if (cancelled) return;
+        setCameraActive(false);
+        if (error.message === 'CAMERA_PERMISSION_TIMEOUT') {
+          setCameraError('Camera permission is still waiting. Allow the browser camera prompt and try again.');
+        } else if (error.name === 'NotAllowedError' || error.name === 'SecurityError') {
+          setCameraError('Camera access was blocked. Allow camera permission in your browser and try again.');
+        } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
+          setCameraError('No camera was found. You can scan with a handheld scanner or type the barcode.');
+        } else if (error.name === 'NotReadableError' || error.name === 'TrackStartError') {
+          setCameraError('The camera is busy or unavailable. Close other apps using it and try again.');
+        } else {
+          setCameraError('Could not start the camera. Use HTTPS or localhost, check camera permission, and try again.');
+        }
+      } finally {
+        clearTimeout(timeoutId);
+        if (!cancelled) setCameraLoading(false);
+      }
+    };
+    startCameraReader();
+
+    return () => {
+      cancelled = true;
+      cameraControlsRef.current?.stop();
+      cameraControlsRef.current = null;
+      cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
+      cameraStreamRef.current = null;
+      if (videoRef.current) videoRef.current.srcObject = null;
+      cameraScanHandledRef.current = false;
+    };
+  }, [cameraActive, lookupBarcode]);
+
+  const stopCamera = () => {
+    cameraControlsRef.current?.stop();
+    cameraControlsRef.current = null;
+    cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
+    cameraStreamRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
+    setCameraActive(false);
+  };
+
+  const startCamera = () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCameraError('Camera scanning needs HTTPS or localhost and a browser that supports camera access.');
+      return;
+    }
+    cameraScanHandledRef.current = false;
+    setCameraError('');
+    setCameraLoading(true);
+    setCameraActive(true);
+  };
+
+  const scan = (event) => {
+    event.preventDefault();
+    lookupBarcode(barcode);
+  };
+
+  const setProductField = (field) => (event) => {
+    setProductForm((current) => ({ ...current, [field]: event.target.value }));
+  };
+
+  const addCategory = async () => {
+    const name = newCategoryName.trim();
+    if (!name) return;
+    setAddingCategory(true);
+    try {
+      const { data } = await api.post('/categories', { name, description: '' });
+      setProductForm((current) => ({ ...current, category_id: String(data.id) }));
+      setNewCategoryName('');
+      categories.reload();
+      toast.success('Category added.');
+    } catch (err) {
+      toast.error(getErrorMessage(err));
+    } finally {
+      setAddingCategory(false);
+    }
+  };
+
+  const receive = async (event) => {
+    event.preventDefault();
+    if (!scanned) return;
+    setSaving(true);
+    try {
+      const response = scanned.type === 'existing'
+        ? await api.post('/inventory/receive', { barcode: barcode.trim(), quantity, expiry_date: expiryDate })
+        : await api.post('/inventory/receive-new', {
+          ...productForm,
+          barcode: barcode.trim(),
+          quantity,
+          expiry_date: expiryDate,
+          status: 'ACTIVE',
+        });
+      toast.success(response.data.message);
+      onDone();
+    } catch (err) {
+      toast.error(getErrorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal title="Scan & receive stock" onClose={onClose} size="lg">
+      <form onSubmit={scan} className="mb-4">
+        <label htmlFor="receive-barcode" className="form-label">Product barcode</label>
+        <div className="input-group">
+          <input
+            ref={barcodeRef}
+            id="receive-barcode"
+            className="form-control"
+            value={barcode}
+            onChange={(event) => setBarcode(event.target.value)}
+            placeholder="Scan barcode, then press Enter"
+            maxLength="50"
+            autoComplete="off"
+            required
+          />
+          <button type="submit" className="btn btn-outline-primary" disabled={lookingUp}>
+            {lookingUp ? 'Looking up...' : 'Find product'}
+          </button>
+        </div>
+        <div className="d-flex flex-wrap align-items-center gap-2 mt-2">
+          {!cameraActive ? (
+            <button type="button" className="btn btn-sm btn-outline-secondary" onClick={startCamera} disabled={lookingUp}>
+              <i className="bi bi-camera me-1"></i>Scan with camera
+            </button>
+          ) : (
+            <>
+              <button type="button" className="btn btn-sm btn-outline-danger" onClick={stopCamera}>
+                <i className="bi bi-camera-video-off me-1"></i>Stop camera
+              </button>
+              {cameraLoading && <span className="small text-secondary">Starting camera... approve the browser permission prompt.</span>}
+            </>
+          )}
+          <span className="form-text mt-0">Or use a handheld scanner or type the barcode.</span>
+        </div>
+      </form>
+
+      {cameraError && <div className="alert alert-warning py-2">{cameraError}</div>}
+      {cameraActive && (
+        <div className="mb-3">
+          <video
+            ref={videoRef}
+            className="w-100 rounded bg-dark"
+            style={{ maxHeight: 320, minHeight: 180, objectFit: 'cover' }}
+            muted
+            playsInline
+            aria-label="Live camera barcode preview"
+          />
+          <div className="form-text">{cameraLoading ? 'Waiting for camera video...' : 'Point your camera at the barcode and hold it steady.'}</div>
+        </div>
+      )}
+      {scanError && <div className="alert alert-info py-2">{scanError}</div>}
+
+      {scanned?.type === 'existing' && (
+        <form onSubmit={receive}>
+          <div className="alert alert-success">
+            <div className="fw-semibold">{scanned.product.name}</div>
+            <div className="small">
+              {scanned.product.category_name} · Barcode {scanned.product.barcode} · Current stock {scanned.product.current_stock}
+            </div>
+          </div>
+          <div className="row g-3">
+            <div className="col-md-6">
+              <label htmlFor="receive-quantity" className="form-label">Quantity received *</label>
+              <input id="receive-quantity" type="number" min="1" max="1000000" required className="form-control"
+                value={quantity} onChange={(event) => setQuantity(event.target.value)} />
+            </div>
+            <div className="col-md-6">
+              <label htmlFor="receive-expiry" className="form-label">Expiry date on this package</label>
+              <input id="receive-expiry" type="date" className="form-control" value={expiryDate}
+                onChange={(event) => setExpiryDate(event.target.value)} />
+            </div>
+          </div>
+          <div className="form-text mt-2">Stock is increased by the received quantity. The product keeps its earliest recorded expiry date; batches are not tracked separately.</div>
+          <div className="d-flex justify-content-end gap-2 mt-4">
+            <button type="button" className="btn btn-outline-secondary" onClick={onClose}>Cancel</button>
+            <button className="btn btn-primary" disabled={saving}>{saving ? 'Receiving...' : 'Receive stock'}</button>
+          </div>
+        </form>
+      )}
+
+      {scanned?.type === 'new' && (
+        canCreateProduct ? (
+          <form onSubmit={receive}>
+            <div className="alert alert-warning py-2">
+              New barcode. {scanned.catalog
+                ? 'Name and category suggestions came from Open Food Facts; verify them before saving.'
+                : 'No catalog entry was available, so enter the product details.'}
+            </div>
+            <div className="row g-3">
+              <div className="col-md-6">
+                <label htmlFor="receive-new-name" className="form-label">Product name *</label>
+                <input id="receive-new-name" className="form-control" required maxLength="150"
+                  value={productForm.name} onChange={setProductField('name')} />
+              </div>
+              <div className="col-md-3">
+                <label htmlFor="receive-new-sku" className="form-label">SKU *</label>
+                <input id="receive-new-sku" className="form-control" required maxLength="50"
+                  value={productForm.sku} onChange={setProductField('sku')} />
+              </div>
+              <div className="col-md-3">
+                <label htmlFor="receive-new-category" className="form-label">Category *</label>
+                <select id="receive-new-category" className="form-select" required value={productForm.category_id}
+                  onChange={setProductField('category_id')}>
+                  <option value="">Select...</option>
+                  {(categories.data || []).map((category) => (
+                    <option key={category.id} value={category.id}>{category.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="col-12">
+                <label htmlFor="receive-new-category-name" className="form-label">Or add a category</label>
+                <div className="input-group">
+                  <input id="receive-new-category-name" className="form-control" maxLength="100"
+                    placeholder="e.g. Snacks" value={newCategoryName}
+                    onChange={(event) => setNewCategoryName(event.target.value)} />
+                  <button type="button" className="btn btn-outline-secondary" disabled={!newCategoryName.trim() || addingCategory}
+                    onClick={addCategory}>
+                    {addingCategory ? 'Adding...' : 'Add category'}
+                  </button>
+                </div>
+              </div>
+              <div className="col-md-4">
+                <label htmlFor="receive-new-brand" className="form-label">Brand</label>
+                <input id="receive-new-brand" className="form-control" maxLength="100"
+                  value={productForm.brand} onChange={setProductField('brand')} />
+              </div>
+              <div className="col-md-4">
+                <label htmlFor="receive-new-purchase" className="form-label">Purchase price *</label>
+                <input id="receive-new-purchase" type="number" min="0" step="0.01" required className="form-control"
+                  value={productForm.purchase_price} onChange={setProductField('purchase_price')} />
+              </div>
+              <div className="col-md-4">
+                <label htmlFor="receive-new-selling" className="form-label">Selling price *</label>
+                <input id="receive-new-selling" type="number" min="0" step="0.01" required className="form-control"
+                  value={productForm.selling_price} onChange={setProductField('selling_price')} />
+              </div>
+              <div className="col-md-6">
+                <label htmlFor="receive-new-quantity" className="form-label">Quantity received *</label>
+                <input id="receive-new-quantity" type="number" min="1" max="1000000" required className="form-control"
+                  value={quantity} onChange={(event) => setQuantity(event.target.value)} />
+              </div>
+              <div className="col-md-6">
+                <label htmlFor="receive-new-expiry" className="form-label">Expiry date on this package</label>
+                <input id="receive-new-expiry" type="date" className="form-control" value={expiryDate}
+                  onChange={(event) => setExpiryDate(event.target.value)} />
+              </div>
+              <div className="col-md-4">
+                <label htmlFor="receive-new-tax" className="form-label">Tax %</label>
+                <input id="receive-new-tax" type="number" min="0" max="100" step="0.01" className="form-control"
+                  value={productForm.tax_percentage} onChange={setProductField('tax_percentage')} />
+              </div>
+              <div className="col-md-4">
+                <label htmlFor="receive-new-min" className="form-label">Minimum stock</label>
+                <input id="receive-new-min" type="number" min="0" className="form-control"
+                  value={productForm.min_stock_level} onChange={setProductField('min_stock_level')} />
+              </div>
+              <div className="col-md-4">
+                <label htmlFor="receive-new-reorder" className="form-label">Reorder quantity</label>
+                <input id="receive-new-reorder" type="number" min="0" className="form-control"
+                  value={productForm.reorder_quantity} onChange={setProductField('reorder_quantity')} />
+              </div>
+            </div>
+            <div className="form-text mt-2">Open Food Facts can suggest a name, brand, and category. Verify the details and enter your prices, expiry, and received quantity.</div>
+            <div className="d-flex justify-content-end gap-2 mt-4">
+              <button type="button" className="btn btn-outline-secondary" onClick={onClose}>Cancel</button>
+              <button className="btn btn-primary" disabled={saving || categories.loading}>
+                {saving ? 'Saving product...' : 'Create product & receive stock'}
+              </button>
+            </div>
+          </form>
+        ) : (
+          <div className="alert alert-warning mb-0">This barcode is not registered. Ask an Admin or Manager to add it as a product before receiving stock.</div>
+        )
+      )}
+    </Modal>
+  );
+}
+
 function Inventory() {
   const { user } = useAuth();
   const canAdjust = ['ADMIN', 'MANAGER', 'STAFF'].includes(user.role);
@@ -1378,6 +1922,7 @@ function Inventory() {
   const [tab, setTab] = useState('low');
   const [page, setPage] = useState(1);
   const [adjust, setAdjust] = useState(false);
+  const [receive, setReceive] = useState(false);
   const isTx = tab === 'transactions';
   const list = useApi(
     isTx ? '/inventory/transactions' : '/products',
@@ -1391,7 +1936,12 @@ function Inventory() {
     <>
       <div className="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
         <h1 className="h4 mb-0">Inventory</h1>
-        {canAdjust && <button className="btn btn-primary" onClick={() => setAdjust(true)}><i className="bi bi-sliders me-1"></i>Adjust stock</button>}
+        {canAdjust && (
+          <div className="d-flex gap-2">
+            <button className="btn btn-outline-primary" onClick={() => setReceive(true)}><i className="bi bi-upc-scan me-1"></i>Scan & receive stock</button>
+            <button className="btn btn-primary" onClick={() => setAdjust(true)}><i className="bi bi-sliders me-1"></i>Adjust stock</button>
+          </div>
+        )}
       </div>
 
       {s && (
@@ -1459,6 +2009,7 @@ function Inventory() {
       </div>
 
       {adjust && <AdjustModal onClose={() => setAdjust(false)} onDone={() => { setAdjust(false); summary.reload(); list.reload(); }} />}
+      {receive && <ReceiveStockModal onClose={() => setReceive(false)} onDone={() => { setReceive(false); summary.reload(); list.reload(); }} canCreateProduct={MANAGERS.includes(user.role)} />}
     </>
   );
 }
@@ -1550,12 +2101,14 @@ function App() {
     <Routes>
       <Route path="/" element={<Navigate to="/dashboard" replace />} />
       <Route path="/login" element={<Login />} />
-      <Route path="/forgot-password" element={<ForgotPassword />} />
+      <Route path="/register" element={<Register />} />
       <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
         <Route path="/dashboard" element={<Dashboard />} />
+        <Route path="/assistant" element={<SmartBizAssistant />} />
         <Route path="/products" element={<Products />} />
         <Route path="/categories" element={<ProtectedRoute roles={MANAGERS}><Categories /></ProtectedRoute>} />
         <Route path="/suppliers" element={<ProtectedRoute roles={MANAGERS}><Suppliers /></ProtectedRoute>} />
+        <Route path="/team" element={<ProtectedRoute roles={ADMINS}><Team /></ProtectedRoute>} />
         <Route path="/inventory" element={<Inventory />} />
         <Route path="/notifications" element={<Notifications />} />
       </Route>

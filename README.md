@@ -2,6 +2,21 @@ SmartBiz helps small kirana shops replace difficult paper bookkeeping with
 product and inventory management, low-stock and expiry notifications, sales
 tracking, and business reports.
 
+The Admin/Manager dashboard charts use recorded sales and gross profit for the
+last seven months and rank products by units sold. Charts remain empty until
+real sales are entered; demo data is not seeded. Other roles see empty sales-chart
+states and do not receive management sales data.
+
+Inventory supports in-app camera scanning and handheld barcode scanners that
+type a code into the "Scan & receive stock" flow. Camera access requires
+browser permission and HTTPS or localhost. Existing products are matched by
+barcode; new numeric barcodes can be looked up in Open Food Facts for name,
+brand, and category suggestions (source:
+[Open Food Facts](https://world.openfoodfacts.org/)). Verify catalog suggestions
+and enter prices, received quantity, and package expiry yourself. Expiry
+tracking stores the earliest date per product rather than tracking individual
+batches.
+
 ## SmartBiz AI Assistant
 
 The authenticated `POST /api/ai/chat` endpoint is a local, deterministic
@@ -31,10 +46,10 @@ forecasts, incoming purchase orders, and multi-product comparisons are not
 currently implemented; the assistant identifies these limitations instead of
 substituting unrelated totals.
 
-The checked-in schema files include a MySQL schema, but the active server opens
-`server/smartbiz.db` through Node's built-in SQLite driver. The assistant
-reuses that active database and requires no schema changes or database
-migration.
+The server uses SQLite locally by default. When `MYSQL_URL` is set, it connects
+to MySQL over TLS using `server/ca.pem` and initializes any missing tables from
+`server/schema.sql`. The assistant uses the same active database as the rest of
+the API.
 
 Assistant data access uses the existing authenticated account role: all roles
 can read product stock; Cashiers and above can read sales, customer balances,
@@ -54,8 +69,9 @@ npm --prefix server install
 
 Create a local `server/.env` file (do not commit it) and configure `JWT_SECRET`,
 `PORT` (optional; defaults to `5000`), and `CLIENT_ORIGIN` (the frontend origin,
-typically `http://localhost:5173`). No AI provider key or additional package is
-required.
+typically `http://localhost:5173`). To use MySQL locally, also set `MYSQL_URL`
+to its connection URL. Without it, the backend uses SQLite. No AI provider key
+is required.
 
 Start both app processes from the project root with `npm run dev`. To run them
 separately in different terminals, use `npm --prefix server run dev` and
@@ -68,11 +84,29 @@ localhost origins.
 
 ### Deployment
 
-Deploy the client and Express server separately. Configure `JWT_SECRET`,
-`PORT` if needed, and `CLIENT_ORIGIN` as backend environment variables. Set
-the frontend build variable `VITE_API_URL` to the deployed API base URL (for
-example, `https://api.example.com/api`), and build with
-`npm --prefix client run build`. Use Node.js 22.5 or newer on the backend.
+The checked-in [Netlify configuration](./netlify.toml) builds the client from
+`client/` and points it at the Render API. If the Render service URL changes,
+update `VITE_API_URL` there and trigger a new Netlify deploy. The Render service
+must allow the Netlify site origin through `CLIENT_ORIGIN`; the checked-in
+[Render blueprint](./render.yaml) sets it for the published site.
+
+The Render blueprint runs the API in production and requires `MYSQL_URL` to be
+set in the Render service's environment settings. Copy Aiven's MySQL connection
+URL into that private setting; do not commit it or share it in chat. The
+backend creates missing tables and keeps existing rows. The URL must point to
+the database that contains the accounts you want to use. Accounts are
+created from the sign-up page and become active immediately. The first
+registered account receives the Admin role; subsequent sign-ups receive Staff
+access. Admins can create employee accounts with Manager, Cashier, or Staff
+roles. Public sign-up cannot select a role, and SmartBiz does not send
+email-verification or password-reset links. No demo accounts are created
+automatically.
+
+Render's free service may sleep, and its local filesystem is ephemeral. Keep
+business data in Aiven, not on the Render filesystem. The deployed service
+refuses to start in production if `MYSQL_URL` is missing, rather than silently
+using a separate local database.
+
 There is no external AI service, outbound AI request, or AI provider credential
 to configure.
 

@@ -52,8 +52,7 @@ describe('SmartBiz AI business data against the current database', () => {
     const inventory = await businessData.execute('get_inventory', { low_stock_only: false, search: '' }, 'STAFF');
     const lowStock = await businessData.execute('get_inventory', { low_stock_only: true, search: '' }, 'CASHIER');
     assert.equal(inventory.products.length, count("products WHERE status = 'ACTIVE'"));
-    assert.ok(inventory.products.length > 0);
-    assert.ok(lowStock.products.length > 0);
+    assert.equal(lowStock.products.length, count("products WHERE status = 'ACTIVE' AND current_stock <= min_stock_level"));
     assert.ok(lowStock.products.every((product) => product.current_stock <= product.min_stock_level));
     const expired = await businessData.execute('get_inventory', {
       low_stock_only: false,
@@ -73,7 +72,7 @@ describe('SmartBiz AI business data against the current database', () => {
     const cashierSummary = await businessData.execute('get_sales_summary', { period: 'all_time' }, 'CASHIER');
     const expected = db.prepare("SELECT COUNT(*) AS count, SUM(final_amount) AS total FROM sales WHERE status <> 'RETURNED'").get();
     assert.equal(adminSummary.sale_count, expected.count);
-    assert.equal(adminSummary.billed_sales_value_including_tax, expected.total);
+    assert.equal(adminSummary.billed_sales_value_including_tax, expected.total || 0);
     assert.equal(typeof adminSummary.net_merchandise_revenue_excluding_tax, 'number');
     assert.equal(typeof adminSummary.gross_profit, 'number');
     assert.equal(cashierSummary.gross_profit, undefined);
@@ -126,19 +125,20 @@ describe('SmartBiz AI business data against the current database', () => {
        JOIN sales s ON s.id = si.sale_id WHERE s.status <> 'RETURNED'
        GROUP BY p.id ORDER BY p.name LIMIT 1`
     ).get();
-    assert.ok(soldProduct);
-    const productResult = await businessData.execute('get_product_sales_summary', {
-      search: soldProduct.name,
-      period: 'all_time',
-    }, 'CASHIER');
-    const matching = productResult.products.find((product) => product.name === soldProduct.name);
-    assert.ok(matching);
-    const expectedUnits = db.prepare(
-      `SELECT SUM(si.quantity - si.returned_quantity) AS units
-       FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN products p ON p.id = si.product_id
-       WHERE p.name = ? AND s.status <> 'RETURNED'`
-    ).get(soldProduct.name).units;
-    assert.equal(matching.units_sold, expectedUnits);
+    if (soldProduct) {
+      const productResult = await businessData.execute('get_product_sales_summary', {
+        search: soldProduct.name,
+        period: 'all_time',
+      }, 'CASHIER');
+      const matching = productResult.products.find((product) => product.name === soldProduct.name);
+      assert.ok(matching);
+      const expectedUnits = db.prepare(
+        `SELECT SUM(si.quantity - si.returned_quantity) AS units
+         FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN products p ON p.id = si.product_id
+         WHERE p.name = ? AND s.status <> 'RETURNED'`
+      ).get(soldProduct.name).units;
+      assert.equal(matching.units_sold, expectedUnits);
+    }
     await assert.rejects(
       businessData.execute('get_product_sales_summary', { search: 'A', period: 'all_time' }, 'STAFF'),
       { status: 403 }
@@ -147,7 +147,8 @@ describe('SmartBiz AI business data against the current database', () => {
 
   it('ranks actual product revenue and returns real empty customer balance records', async () => {
     const top = await businessData.execute('get_top_products_by_revenue', { period: 'all_time' }, 'MANAGER');
-    assert.ok(top.products.length > 0);
+    if (count('sale_items') === 0) assert.deepEqual(top.products, []);
+    else assert.ok(top.products.length > 0);
     assert.ok(top.products.every((product) => product.net_revenue_excluding_tax > 0 && product.units_sold > 0));
     const customers = await businessData.execute('get_customer_balances', { search: '' }, 'CASHIER');
     assert.equal(customers.customers.length, count('customers'));
@@ -163,9 +164,10 @@ describe('SmartBiz AI business data against the current database', () => {
     const purchases = await businessData.execute('get_purchase_summary', { period: 'all_time' }, 'ADMIN');
     const expected = db.prepare('SELECT COUNT(*) AS count, SUM(total_amount) AS total FROM purchases').get();
     assert.equal(purchases.purchase_count, expected.count);
-    assert.equal(purchases.total_purchase_value, expected.total);
+    assert.equal(purchases.total_purchase_value, expected.total || 0);
     assert.ok(Array.isArray(purchases.top_purchased_products));
-    assert.ok(purchases.top_purchased_products.length > 0);
+    if (count('purchase_items') === 0) assert.deepEqual(purchases.top_purchased_products, []);
+    else assert.ok(purchases.top_purchased_products.length > 0);
     assert.equal(purchases.purchases_missing_item_details, db.prepare(
       `SELECT COUNT(*) AS count FROM purchases p
        WHERE NOT EXISTS (SELECT 1 FROM purchase_items pi WHERE pi.purchase_id = p.id)`
@@ -186,9 +188,10 @@ describe('SmartBiz AI business data against the current database', () => {
     assert.deepEqual(returns.returned_products, []);
     const adminPayments = await businessData.execute('get_payment_summary', { period: 'all_time', payment_type: 'all' }, 'ADMIN');
     const cashierPayments = await businessData.execute('get_payment_summary', { period: 'all_time', payment_type: 'sales' }, 'CASHIER');
-    assert.ok(adminPayments.payments.length > 0);
     assert.ok(cashierPayments.payments.every((payment) => payment.payment_type === 'sales'));
     const recordedPayments = db.prepare('SELECT SUM(amount) AS amount FROM payments').get().amount;
+    if (recordedPayments) assert.ok(adminPayments.payments.length > 0);
+    else assert.deepEqual(adminPayments.payments, []);
     assert.ok(Math.abs(adminPayments.payments.reduce((total, payment) => total + payment.payment_amount, 0) - recordedPayments) < 0.01);
     if (count('returns') === 0) assert.equal(returns.refunds, 0);
   });
@@ -198,10 +201,10 @@ describe('SmartBiz AI business data against the current database', () => {
     const suppliers = await businessData.execute('get_directory', { entity: 'suppliers', search: '' }, 'ADMIN');
     assert.equal(customers.names.length, count('customers'));
     assert.equal(suppliers.names.length, count('suppliers'));
-    assert.ok(suppliers.names.length > 0);
+    assert.equal(suppliers.names.length, count('suppliers'));
     assert.ok(suppliers.names.every((name) => typeof name === 'string'));
     const report = await businessData.execute('get_dashboard_report', {}, 'MANAGER');
-    assert.ok(report.products.total_products > 0);
+    assert.equal(report.products.total_products, count("products WHERE status = 'ACTIVE'"));
     assert.ok(Array.isArray(report.sales_by_month));
     assert.ok(Array.isArray(report.purchases_by_month));
     assert.ok(Array.isArray(report.top_selling));

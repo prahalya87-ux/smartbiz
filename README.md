@@ -52,8 +52,10 @@ The server uses SQLite locally by default. When `MYSQL_URL` is set, it connects
 to MySQL over TLS and initializes any missing tables from `server/schema.sql`.
 By default, TLS trusts the bundled Aiven CA in `server/ca.pem`. Set
 `MYSQL_SSL_CA=system` to use Node.js's trusted root CAs, or set `MYSQL_SSL_CA`
-to a provider's PEM certificate contents. The assistant uses the same active
-database as the rest of the API.
+to a provider's PEM certificate contents or a certificate path relative to the
+backend directory. The Render blueprint uses
+`MYSQL_SSL_CA=certs/isrgrootx1.pem` for TiDB Cloud Starter. The assistant uses
+the same active database as the rest of the API.
 
 Assistant data access uses the existing authenticated account role: all roles
 can read product stock; Cashiers and above can read sales, customer balances,

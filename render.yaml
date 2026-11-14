@@ -18,7 +18,7 @@ services:
       - key: MYSQL_URL
         sync: false
       - key: MYSQL_SSL_CA
-        value: system
+        value: certs/isrgrootx1.pem
       - key: JWT_SECRET
         generateValue: true
       - key: JWT_EXPIRES_IN

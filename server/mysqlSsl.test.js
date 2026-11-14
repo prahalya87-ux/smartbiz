@@ -12,6 +12,10 @@ describe('MySQL TLS configuration', () => {
     assert.deepEqual(getMysqlSslOptions(ca), { ca });
   });
 
+  it('loads a CA certificate from a path relative to the backend', () => {
+    assert.match(getMysqlSslOptions('certs/isrgrootx1.pem').ca, /BEGIN CERTIFICATE/);
+  });
+
   it('keeps the bundled Aiven CA as the default', () => {
     assert.match(getMysqlSslOptions().ca, /BEGIN CERTIFICATE/);
   });

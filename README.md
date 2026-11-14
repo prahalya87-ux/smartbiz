@@ -61,8 +61,9 @@ and the dashboard report. Supplier directory results contain names only.
 
 ### Local setup
 
-Use Node.js 22.5 or newer (the backend uses `node:sqlite`). Install the existing
-frontend and backend dependencies from the project root:
+Use Node.js 22.12.0 or newer (the backend uses `node:sqlite`, and Vite 8
+requires Node.js 20.19+ or 22.12+). Install the existing frontend and backend
+dependencies from the project root:
 
 ```sh
 npm --prefix client install

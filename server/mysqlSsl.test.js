@@ -1,10 +1,13 @@
 const assert = require('node:assert/strict');
 const { describe, it } = require('node:test');
+const tls = require('node:tls');
 const { getMysqlSslOptions } = require('./mysqlSsl');
 
 describe('MySQL TLS configuration', () => {
-  it('uses the system trust store when requested', () => {
-    assert.deepEqual(getMysqlSslOptions('system'), {});
+  it('uses system roots and the bundled TiDB CA when requested', () => {
+    const options = getMysqlSslOptions('system');
+    assert.deepEqual(options.ca.slice(0, tls.rootCertificates.length), tls.rootCertificates);
+    assert.match(options.ca.at(-1), /BEGIN CERTIFICATE/);
   });
 
   it('accepts a provider-supplied CA certificate', () => {
@@ -16,7 +19,7 @@ describe('MySQL TLS configuration', () => {
     assert.match(getMysqlSslOptions('certs/isrgrootx1.pem').ca, /BEGIN CERTIFICATE/);
   });
 
-  it('keeps the bundled Aiven CA as the default', () => {
+  it('uses the bundled TiDB CA by default', () => {
     assert.match(getMysqlSslOptions().ca, /BEGIN CERTIFICATE/);
   });
 });

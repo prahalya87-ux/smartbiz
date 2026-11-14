@@ -16,6 +16,7 @@ const fs = require('fs');
 const { createAiBusinessData } = require('./aiBusinessData');
 const { answerLocalQuestion } = require('./aiLocalAssistant');
 const { isSupportedBarcode, lookupBarcode } = require('./barcodeCatalog');
+const { getMysqlSslOptions } = require('./mysqlSsl');
 const {
   PASSWORD_RESET_CODE_TTL_MS,
   PASSWORD_RESET_MAX_ATTEMPTS,
@@ -55,16 +56,15 @@ if (useMysql) {
     throw new Error('MYSQL_URL must use the mysql:// scheme.');
   }
   if (!connectionUrl.hostname || !connectionUrl.username || !connectionUrl.password || !connectionUrl.pathname.slice(1)) {
-    throw new Error('MYSQL_URL must include the Aiven host, username, password, and database name.');
+    throw new Error('MYSQL_URL must include the database host, username, password, and database name.');
   }
-  const ca = fs.readFileSync(path.join(__dirname, 'ca.pem'), 'utf8');
   mysqlPool = mysql.createPool({
     host: connectionUrl.hostname,
     port: Number(connectionUrl.port || 3306),
     user: decodeURIComponent(connectionUrl.username),
     password: decodeURIComponent(connectionUrl.password),
     database: decodeURIComponent(connectionUrl.pathname.replace(/^\//, '')),
-    ssl: { ca },
+    ssl: getMysqlSslOptions(),
     waitForConnections: true,
     connectionLimit: 10,
     charset: 'utf8mb4',
@@ -1492,7 +1492,7 @@ async function start() {
   await initializeDatabase();
   const PORT = process.env.PORT || 5000;
   app.listen(PORT, () => {
-    console.log(`SmartBiz API running on port ${PORT} using ${useMysql ? 'Aiven/MySQL' : 'SQLite'}`);
+    console.log(`SmartBiz API running on port ${PORT} using ${useMysql ? 'MySQL' : 'SQLite'}`);
     setTimeout(() => syncAlerts().catch((err) => console.error('Alert sync failed:', err.message)), 1000);
   });
 }

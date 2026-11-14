@@ -49,9 +49,11 @@ currently implemented; the assistant identifies these limitations instead of
 substituting unrelated totals.
 
 The server uses SQLite locally by default. When `MYSQL_URL` is set, it connects
-to MySQL over TLS using `server/ca.pem` and initializes any missing tables from
-`server/schema.sql`. The assistant uses the same active database as the rest of
-the API.
+to MySQL over TLS and initializes any missing tables from `server/schema.sql`.
+By default, TLS trusts the bundled Aiven CA in `server/ca.pem`. Set
+`MYSQL_SSL_CA=system` to use Node.js's trusted root CAs, or set `MYSQL_SSL_CA`
+to a provider's PEM certificate contents. The assistant uses the same active
+database as the rest of the API.
 
 Assistant data access uses the existing authenticated account role: all roles
 can read product stock; Cashiers and above can read sales, customer balances,
@@ -101,10 +103,20 @@ must allow the Netlify site origin through `CLIENT_ORIGIN`; the checked-in
 [Render blueprint](./render.yaml) sets it for the published site.
 
 The Render blueprint runs the API in production and requires `MYSQL_URL` to be
-set in the Render service's environment settings. Copy Aiven's MySQL connection
-URL into that private setting; do not commit it or share it in chat. The
-backend creates missing tables and keeps existing rows. The URL must point to
-the database that contains the accounts you want to use. Accounts are
+set in the Render service's environment settings. Set it to the private
+connection URL for the chosen MySQL-compatible provider; do not commit it or
+share it in chat. For Aiven, leave `MYSQL_SSL_CA` unset. For TiDB Cloud Starter,
+set `MYSQL_SSL_CA=system`; use the prefixed database username from TiDB's
+connection details. The backend creates missing tables and keeps existing
+rows. Point the URL at a database containing the accounts you want to use.
+TiDB Cloud Starter is MySQL-protocol compatible, but its free quota is limited
+to 5 GiB row storage, 5 GiB columnar storage, and 50 million request units per
+month; exceeding the quota can block new connections. The schema uses foreign
+keys, so verify the selected TiDB version supports them (generally available
+starting with TiDB 8.5) and test the schema before production use.
+Changing providers does not copy data: export the old database and import it to
+the new provider before switching the production URL. In particular, Aiven must
+be accessible again before its existing rows can be exported. Accounts are
 created from the sign-up page and become active immediately. The first
 registered account receives the Admin role; subsequent sign-ups receive Staff
 access. Admins can create employee accounts with Manager, Cashier, or Staff
@@ -113,9 +125,9 @@ email-verification links; password recovery uses a one-time email code. No demo
 accounts are created automatically.
 
 Render's free service may sleep, and its local filesystem is ephemeral. Keep
-business data in Aiven, not on the Render filesystem. The deployed service
-refuses to start in production if `MYSQL_URL` is missing, rather than silently
-using a separate local database.
+business data in the configured MySQL provider, not on the Render filesystem.
+The deployed service refuses to start in production if `MYSQL_URL` is missing,
+rather than silently using a separate local database.
 
 There is no external AI service, outbound AI request, or AI provider credential
 to configure.

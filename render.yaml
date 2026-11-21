@@ -14,7 +14,7 @@ services:
       - key: NODE_VERSION
         value: "22.12.0"
       - key: CLIENT_ORIGIN
-        value: https://smartbiz-management-system.netlify.app
+        value: https://smartbiz-lake.vercel.app,https://smartbiz-management-system.netlify.app
       - key: MYSQL_URL
         sync: false
       - key: MYSQL_SSL_CA

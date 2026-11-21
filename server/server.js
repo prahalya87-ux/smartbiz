@@ -340,6 +340,7 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 // Allow the deployed client and localhost ports while developing.
 const allowedOrigins = new Set([
   'https://smartbiz-management-system.netlify.app',
+  'https://smartbiz-lake.vercel.app',
   ...(process.env.CLIENT_ORIGIN || '').split(',').map((origin) => origin.trim()).filter(Boolean),
 ]);
 app.use(cors({
@@ -673,7 +674,11 @@ app.post(
       await conn.commit();
       inTransaction = false;
 
-      const clientOrigin = process.env.CLIENT_ORIGIN || 'http://localhost:5173';
+      const clientOrigin = process.env.CLIENT_ORIGIN || (
+        process.env.NODE_ENV === 'production'
+          ? 'https://smartbiz-lake.vercel.app'
+          : 'http://localhost:5173'
+      );
       const invitationUrl = new URL('/accept-invitation', clientOrigin).toString() + `?token=${encodeURIComponent(token)}`;
       try {
         await mailTransport.sendMail({

@@ -125,11 +125,14 @@ localhost origins.
 
 ### Deployment
 
-The checked-in [Netlify configuration](./netlify.toml) builds the client from
-`client/` and points it at the Render API. If the Render service URL changes,
-update `VITE_API_URL` there and trigger a new Netlify deploy. The Render service
-must allow the Netlify site origin through `CLIENT_ORIGIN`; the checked-in
-[Render blueprint](./render.yaml) sets it for the published site.
+The client can be deployed to Vercel with `client/` as the project root.
+`client/vercel.json` provides the SPA fallback for React Router, and
+`client/.env.production` points the client at the Render API. If the Render API
+URL changes, update `VITE_API_URL` in the Vercel project settings as well. The
+API's `CLIENT_ORIGIN` accepts a comma-separated allowlist so the Vercel
+production domain and any retained Netlify domain can both be allowed. The
+checked-in [Netlify configuration](./netlify.toml) remains available as an
+alternative static-hosting setup.
 
 The Render blueprint runs the API in production and requires `MYSQL_URL` to be
 set in the Render service's environment settings. Set it to the private

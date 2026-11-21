@@ -340,8 +340,8 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 // Allow the deployed client and localhost ports while developing.
 const allowedOrigins = new Set([
   'https://smartbiz-management-system.netlify.app',
-  process.env.CLIENT_ORIGIN,
-].filter(Boolean));
+  ...(process.env.CLIENT_ORIGIN || '').split(',').map((origin) => origin.trim()).filter(Boolean),
+]);
 app.use(cors({
   origin(origin, callback) {
     if (!origin || allowedOrigins.has(origin)) return callback(null, true);

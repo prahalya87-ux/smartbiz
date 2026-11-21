@@ -33,7 +33,7 @@ api.interceptors.response.use(
 );
 
 const getErrorMessage = (err) => {
-  const isAccountRoute = /^\/auth\/(login|signup|forgot-password|reset-password)$/.test(err.config?.url || '');
+  const isAccountRoute = /^\/auth\/(login|signup|forgot-password|reset-password|change-password)$/.test(err.config?.url || '');
   if (err.response?.status === 404 && isAccountRoute) {
     return 'The account service is missing on the server. Please ask the administrator to deploy the latest SmartBiz API.';
   }
@@ -67,8 +67,15 @@ function AuthProvider({ children }) {
     return res.data.user;
   };
 
-  const signup = async (name, email, password) => {
-    const res = await api.post('/auth/signup', { name, email, password });
+  const signup = async (registration) => {
+    const res = await api.post('/auth/signup', registration);
+    localStorage.setItem('token', res.data.token);
+    setUser(res.data.user);
+    return res.data.user;
+  };
+
+  const acceptInvitation = async (token, name, password) => {
+    const res = await api.post('/auth/accept-invitation', { token, name, password });
     localStorage.setItem('token', res.data.token);
     setUser(res.data.user);
     return res.data.user;
@@ -84,7 +91,7 @@ function AuthProvider({ children }) {
     setUser(null);
   };
 
-  return <AuthContext.Provider value={{ user, loading, login, signup, logout }}>{children}</AuthContext.Provider>;
+  return <AuthContext.Provider value={{ user, loading, login, signup, acceptInvitation, logout }}>{children}</AuthContext.Provider>;
 }
 
 // ---------- Route protection ----------
@@ -163,6 +170,7 @@ function Login() {
             {submitting ? 'Signing in...' : 'Sign in'}
           </button>
         </form>
+
         <p className="text-center text-secondary small mt-3 mb-0">
           New to SmartBiz? <Link to="/register">Create an account</Link>
         </p>
@@ -284,12 +292,71 @@ function ForgotPassword() {
 function Register() {
   const { user, signup } = useAuth();
   const navigate = useNavigate();
-  const [form, setForm] = useState({ name: '', email: '', password: '', confirmPassword: '' });
+  const [form, setForm] = useState({
+    name: '', email: '', phone: '', password: '', confirmPassword: '',
+    shopName: '', shopType: 'Kirana', address: '', country: 'India',
+    state: '', city: '', area: '', pincode: '', latitude: '', longitude: '',
+  });
   const [submitting, setSubmitting] = useState(false);
+  const [detectingLocation, setDetectingLocation] = useState(false);
+  const [locationMessage, setLocationMessage] = useState('');
+  const [locationError, setLocationError] = useState('');
+  const [registrationResult, setRegistrationResult] = useState(null);
 
-  if (user) return <Navigate to="/dashboard" replace />;
+  if (user && !registrationResult) return <Navigate to="/dashboard" replace />;
 
-  const handleChange = (event) => setForm({ ...form, [event.target.name]: event.target.value });
+  const handleChange = (event) => setForm((current) => ({ ...current, [event.target.name]: event.target.value }));
+
+  const detectLocation = () => {
+    setLocationError('');
+    setLocationMessage('');
+    if (!navigator.geolocation) {
+      setLocationError('This browser does not support location detection. Enter the shop address manually.');
+      return;
+    }
+
+    setDetectingLocation(true);
+    navigator.geolocation.getCurrentPosition(async ({ coords }) => {
+      const { latitude, longitude } = coords;
+      setForm((current) => ({ ...current, latitude: String(latitude), longitude: String(longitude) }));
+      setLocationMessage('Location detected. Confirm that this is your shop location and correct any address details.');
+      try {
+        const url = new URL('https://nominatim.openstreetmap.org/reverse');
+        url.search = new URLSearchParams({
+          format: 'jsonv2',
+          addressdetails: '1',
+          lat: String(latitude),
+          lon: String(longitude),
+          zoom: '18',
+        });
+        const response = await fetch(url);
+        if (!response.ok) throw new Error('Address lookup failed.');
+        const result = await response.json();
+        const place = result.address || {};
+        setForm((current) => ({
+          ...current,
+          address: result.display_name || current.address,
+          country: place.country || current.country,
+          state: place.state || place.region || current.state,
+          city: place.city || place.town || place.village || place.municipality || current.city,
+          area: place.suburb || place.neighbourhood || place.quarter || place.hamlet || current.area,
+          pincode: place.postcode || current.pincode,
+        }));
+      } catch {
+        setLocationError('Coordinates were detected, but the address lookup failed. Enter or correct the shop address manually.');
+      } finally {
+        setDetectingLocation(false);
+      }
+    }, (error) => {
+      const message = error.code === error.PERMISSION_DENIED
+        ? 'Location permission was denied. You can still enter the shop address manually.'
+        : error.code === error.POSITION_UNAVAILABLE
+          ? 'Your current location is unavailable. Enter the shop address manually.'
+          : 'Location detection timed out. Enter the shop address manually.';
+      setLocationError(message);
+      setDetectingLocation(false);
+    }, { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 });
+  };
 
   const handleSubmit = async (event) => {
     event.preventDefault();
@@ -299,9 +366,10 @@ function Register() {
     }
     setSubmitting(true);
     try {
-      const newUser = await signup(form.name, form.email, form.password);
+      const { confirmPassword, ...registration } = form;
+      const newUser = await signup(registration);
+      setRegistrationResult(newUser);
       toast.success(`Welcome to SmartBiz, ${newUser.name}!`);
-      navigate('/dashboard', { replace: true });
     } catch (err) {
       toast.error(getErrorMessage(err));
     } finally {
@@ -309,46 +377,208 @@ function Register() {
     }
   };
 
+  if (registrationResult) {
+    return (
+      <div className="container d-flex align-items-center justify-content-center min-vh-100 py-4">
+        <div className="card p-4 p-md-5 shadow-sm text-center" style={{ maxWidth: 560, width: '100%' }}>
+          <div className="text-success display-4 mb-3"><i className="bi bi-check-circle-fill" aria-hidden="true"></i></div>
+          <h1 className="h3">Your shop is registered</h1>
+          <p className="text-secondary">You are the Admin/Owner of {registrationResult.shop_name}.</p>
+          <div className="rounded border bg-light p-3 mb-4">
+            <div className="small text-uppercase text-secondary fw-semibold">Your SmartBiz Shop Code</div>
+            <div className="fs-3 fw-bold text-primary">{registrationResult.shop_code}</div>
+            <div className="small text-secondary">Keep this code for your shop records.</div>
+          </div>
+          <button type="button" className="btn btn-primary" onClick={() => navigate('/dashboard', { replace: true })}>
+            Continue to your shop
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const mapUrl = form.latitude && form.longitude
+    ? `https://www.openstreetmap.org/export/embed.html?bbox=${Number(form.longitude) - 0.01}%2C${Number(form.latitude) - 0.01}%2C${Number(form.longitude) + 0.01}%2C${Number(form.latitude) + 0.01}&layer=mapnik&marker=${form.latitude}%2C${form.longitude}`
+    : '';
+
   return (
     <div className="container d-flex align-items-center justify-content-center min-vh-100 py-4">
-      <div className="card p-4 shadow-sm" style={{ maxWidth: 460, width: '100%' }}>
+      <div className="card p-4 p-md-5 shadow-sm" style={{ maxWidth: 820, width: '100%' }}>
         <div className="text-center mb-4">
           <i className="bi bi-box-seam fs-1 text-primary" aria-hidden="true"></i>
-          <h1 className="h4 mt-2 mb-0">Create your SmartBiz account</h1>
-          <p className="text-secondary small mb-0">Get started managing your shop</p>
+          <h1 className="h4 mt-2 mb-0">Register your shop</h1>
+          <p className="text-secondary small mb-0">Create an owner account and a separate SmartBiz workspace</p>
         </div>
-        <form onSubmit={handleSubmit}>
-          <div className="mb-3">
+        <form onSubmit={handleSubmit} className="row g-3">
+          <div className="col-12"><h2 className="h6 mb-0">Owner details</h2></div>
+          <div className="col-md-6">
             <label htmlFor="register-name" className="form-label">Full name</label>
             <input id="register-name" name="name" type="text" className="form-control" required maxLength={100}
               autoComplete="name" autoFocus value={form.name} onChange={handleChange} />
           </div>
-          <div className="mb-3">
-            <label htmlFor="register-email" className="form-label">Email</label>
+          <div className="col-md-6">
+            <label htmlFor="register-email" className="form-label">Email address</label>
             <input id="register-email" name="email" type="email" className="form-control" required maxLength={150}
               autoComplete="email" value={form.email} onChange={handleChange} />
           </div>
-          <div className="mb-3">
+          <div className="col-md-6">
+            <label htmlFor="register-phone" className="form-label">Phone number</label>
+            <input id="register-phone" name="phone" type="tel" className="form-control" required maxLength={20}
+              autoComplete="tel" value={form.phone} onChange={handleChange} />
+          </div>
+          <div className="col-md-6">
             <label htmlFor="register-password" className="form-label">Password</label>
             <input id="register-password" name="password" type="password" className="form-control" required minLength={8}
               autoComplete="new-password" value={form.password} onChange={handleChange} />
-            <div className="form-text">Use at least 8 characters with uppercase, lowercase, a number, and a symbol.</div>
+            <div className="form-text">Use uppercase, lowercase, a number, and a symbol.</div>
           </div>
-          <div className="mb-3">
+          <div className="col-md-6">
             <label htmlFor="register-confirm-password" className="form-label">Confirm password</label>
             <input id="register-confirm-password" name="confirmPassword" type="password" className="form-control" required
               autoComplete="new-password" value={form.confirmPassword} onChange={handleChange} />
           </div>
-          <div className="alert alert-light border small">
-            The first account for a shop becomes Admin. Later accounts receive Staff access. Accounts are active immediately.
+
+          <div className="col-12 mt-4"><h2 className="h6 mb-0">Shop details</h2></div>
+          <div className="col-md-6">
+            <label htmlFor="register-shop-name" className="form-label">Shop name</label>
+            <input id="register-shop-name" name="shopName" className="form-control" required maxLength={150}
+              value={form.shopName} onChange={handleChange} />
           </div>
-          <button className="btn btn-primary w-100" disabled={submitting}>
-            {submitting ? 'Creating account...' : 'Create account'}
-          </button>
+          <div className="col-md-6">
+            <label htmlFor="register-shop-type" className="form-label">Shop type</label>
+            <select id="register-shop-type" name="shopType" className="form-select" value={form.shopType} onChange={handleChange}>
+              {['Grocery', 'Kirana', 'Supermarket', 'Medical', 'Clothing', 'Electronics', 'Other']
+                .map((type) => <option key={type} value={type}>{type}</option>)}
+            </select>
+          </div>
+
+          <div className="col-12 mt-4 d-flex flex-wrap justify-content-between align-items-center gap-2">
+            <h2 className="h6 mb-0">Shop location</h2>
+            <button type="button" className="btn btn-outline-primary btn-sm" onClick={detectLocation} disabled={detectingLocation}>
+              <i className="bi bi-geo-alt me-1" aria-hidden="true"></i>
+              {detectingLocation ? 'Detecting location...' : 'Detect My Current Location'}
+            </button>
+          </div>
+          <div className="col-12">
+            <label htmlFor="register-address" className="form-label">Shop address</label>
+            <textarea id="register-address" name="address" className="form-control" required maxLength={255} rows={2}
+              value={form.address} onChange={handleChange} />
+          </div>
+          {[
+            ['country', 'Country'], ['state', 'State'], ['city', 'City'], ['area', 'Area / Locality'], ['pincode', 'PIN Code'],
+          ].map(([name, label]) => (
+            <div className="col-sm-6 col-md-4" key={name}>
+              <label htmlFor={`register-${name}`} className="form-label">{label}</label>
+              <input id={`register-${name}`} name={name} className="form-control" required maxLength={name === 'pincode' ? 20 : 100}
+                autoComplete={name === 'pincode' ? 'postal-code' : 'address-level2'}
+                value={form[name]} onChange={handleChange} />
+            </div>
+          ))}
+          {locationMessage && <div className="col-12"><div className="alert alert-success py-2 mb-0" role="status">{locationMessage}</div></div>}
+          {locationError && <div className="col-12"><div className="alert alert-warning py-2 mb-0" role="alert">{locationError}</div></div>}
+          {mapUrl && (
+            <div className="col-12">
+              <div className="small text-secondary mb-2">Map preview. Verify this marker is at your shop, not just your current device location.</div>
+              <iframe title="Detected shop location map" src={mapUrl} className="w-100 border rounded"
+                height="220" loading="lazy" referrerPolicy="no-referrer" />
+            </div>
+          )}
+          <div className="col-12">
+            <div className="alert alert-light border small mb-0">
+              Your shop gets a unique ID and code. The registering owner becomes its Admin; employees join through invitations.
+            </div>
+          </div>
+          <div className="col-12">
+            <button className="btn btn-primary w-100" disabled={submitting || detectingLocation}>
+              {submitting ? 'Registering shop...' : 'Register shop'}
+            </button>
+          </div>
         </form>
         <p className="text-center text-secondary small mt-3 mb-0">
           Already have an account? <Link to="/login">Sign in</Link>
         </p>
+      </div>
+    </div>
+  );
+}
+
+function AcceptInvitation() {
+  const { acceptInvitation } = useAuth();
+  const [searchParams] = useSearchParams();
+  const token = searchParams.get('token') || '';
+  const [invitation, setInvitation] = useState(null);
+  const [name, setName] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (!token) {
+      setError('Invitation link is missing its token.');
+      setLoading(false);
+      return;
+    }
+    api.get(`/auth/invitations/${encodeURIComponent(token)}`)
+      .then(({ data }) => setInvitation(data))
+      .catch((err) => setError(getErrorMessage(err)))
+      .finally(() => setLoading(false));
+  }, [token]);
+
+  const submit = async (event) => {
+    event.preventDefault();
+    if (password !== confirmPassword) {
+      setError('Passwords do not match.');
+      return;
+    }
+    setSubmitting(true);
+    setError('');
+    try {
+      await acceptInvitation(token, name, password);
+      window.location.assign('/dashboard');
+    } catch (err) {
+      setError(getErrorMessage(err));
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="container d-flex align-items-center justify-content-center min-vh-100 py-4">
+      <div className="card p-4 shadow-sm" style={{ maxWidth: 480, width: '100%' }}>
+        <h1 className="h4">Join a SmartBiz shop</h1>
+        {loading ? <p className="text-secondary">Checking invitation...</p> : null}
+        {error && <div className="alert alert-danger py-2" role="alert">{error}</div>}
+        {invitation && (
+          <>
+            <p className="text-secondary">
+              You are invited to <strong>{invitation.shop_name}</strong> as <strong>{invitation.role}</strong>.
+            </p>
+            <div className="mb-3"><span className="small text-secondary">Invited email</span><div>{invitation.email}</div></div>
+            <form onSubmit={submit}>
+              <div className="mb-3">
+                <label htmlFor="invite-name" className="form-label">Full name</label>
+                <input id="invite-name" className="form-control" required maxLength={100} value={name}
+                  onChange={(event) => setName(event.target.value)} />
+              </div>
+              <div className="mb-3">
+                <label htmlFor="invite-password" className="form-label">Create password</label>
+                <input id="invite-password" type="password" className="form-control" required minLength={8}
+                  autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} />
+                <div className="form-text">Use uppercase, lowercase, a number, and a symbol.</div>
+              </div>
+              <div className="mb-3">
+                <label htmlFor="invite-confirm-password" className="form-label">Confirm password</label>
+                <input id="invite-confirm-password" type="password" className="form-control" required
+                  autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} />
+              </div>
+              <button className="btn btn-primary w-100" disabled={submitting}>
+                {submitting ? 'Joining shop...' : 'Accept invitation'}
+              </button>
+            </form>
+          </>
+        )}
+        {!loading && !invitation && <Link to="/login" className="btn btn-outline-primary">Back to sign in</Link>}
       </div>
     </div>
   );
@@ -478,7 +708,6 @@ const SEVERITY = { CRITICAL: ['danger', 'Critical'], WARNING: ['orange', 'Warnin
 // ---------- Layout: sidebar + top bar + breadcrumb ----------
 const NAV = [
   { to: '/dashboard', label: 'Dashboard', icon: 'speedometer2' },
-  { to: '/assistant', label: 'AI Assistant', icon: 'stars' },
   { to: '/products', label: 'Products', icon: 'box-seam' },
   { to: '/categories', label: 'Categories', icon: 'tags', roles: MANAGERS },
   { to: '/suppliers', label: 'Suppliers', icon: 'truck', roles: MANAGERS },
@@ -495,7 +724,7 @@ const AI_SUGGESTIONS = [
   'Compare this month with last month.',
 ];
 
-function SmartBizAssistant() {
+function SmartBizAssistant({ compact = false, onClose }) {
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -577,7 +806,7 @@ function SmartBizAssistant() {
 
   return (
     <>
-      <section className="sb-ai-panel" aria-label="SmartBiz AI Assistant">
+      <section className={`sb-ai-panel ${compact ? 'sb-ai-panel-compact' : ''}`} aria-label="SmartBiz AI Assistant">
         <header className="sb-ai-header">
           <div className="d-flex align-items-center gap-2">
             <span className="sb-ai-header-icon" aria-hidden="true"><i className="bi bi-stars"></i></span>
@@ -590,6 +819,12 @@ function SmartBizAssistant() {
             onClick={startNewConversation}>
             <i className="bi bi-plus-lg" aria-hidden="true"></i>
           </button>
+          {compact && (
+            <button type="button" className="sb-ai-icon-button" aria-label="Close assistant" title="Close assistant"
+              onClick={onClose}>
+              <i className="bi bi-x-lg" aria-hidden="true"></i>
+            </button>
+          )}
         </header>
 
         <div className="sb-ai-conversation" ref={conversationRef} aria-live="polite">
@@ -700,8 +935,84 @@ function SmartBizAssistant() {
         .sb-ai-icon-button:focus-visible,.sb-ai-suggestion:focus-visible,.sb-ai-send:focus-visible{outline:3px solid #a5d8b5;outline-offset:2px}
         @keyframes sb-ai-dot{0%,60%,100%{opacity:.35;transform:translateY(0)}30%{opacity:1;transform:translateY(-3px)}}
         @media(max-width:767px){.sb-ai-panel{height:calc(100dvh - 240px);min-height:400px}}
+        .sb-ai-panel-compact{height:540px;min-height:320px;max-height:calc(100dvh - 100px)}
+        @media(max-width:767px){.sb-ai-panel-compact{height:calc(100dvh - 100px);min-height:320px}}
         @media(prefers-reduced-motion:reduce){.sb-ai-panel *{animation-duration:.01ms!important;transition-duration:.01ms!important}}
       `}</style>
+    </>
+  );
+}
+
+function ChangePasswordModal({ onClose }) {
+  const [form, setForm] = useState({ currentPassword: '', newPassword: '', confirmPassword: '' });
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const updateForm = (event) => setForm((current) => ({ ...current, [event.target.name]: event.target.value }));
+
+  const submit = async (event) => {
+    event.preventDefault();
+    setError('');
+    if (form.newPassword !== form.confirmPassword) {
+      setError('New passwords do not match.');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const { data } = await api.post('/auth/change-password', {
+        currentPassword: form.currentPassword,
+        newPassword: form.newPassword,
+      });
+      toast.success(data.message);
+      onClose();
+    } catch (requestError) {
+      setError(getErrorMessage(requestError));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <>
+      <div className="modal-backdrop fade show" style={{ zIndex: 1090 }} onClick={onClose}></div>
+      <div className="modal d-block" role="dialog" aria-modal="true" aria-labelledby="change-password-title"
+        style={{ zIndex: 1091 }} onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+        <div className="modal-dialog modal-dialog-centered">
+          <div className="modal-content">
+            <form onSubmit={submit}>
+              <div className="modal-header">
+                <h2 className="modal-title fs-5" id="change-password-title">Change password</h2>
+                <button type="button" className="btn-close" aria-label="Close" onClick={onClose}></button>
+              </div>
+              <div className="modal-body">
+                {error && <div className="alert alert-danger py-2" role="alert">{error}</div>}
+                <div className="mb-3">
+                  <label htmlFor="current-password" className="form-label">Current password</label>
+                  <input id="current-password" name="currentPassword" type="password" className="form-control"
+                    autoComplete="current-password" required value={form.currentPassword} onChange={updateForm} />
+                </div>
+                <div className="mb-3">
+                  <label htmlFor="new-password" className="form-label">New password</label>
+                  <input id="new-password" name="newPassword" type="password" className="form-control"
+                    autoComplete="new-password" required value={form.newPassword} onChange={updateForm} />
+                  <div className="form-text">Use at least 8 characters with uppercase, lowercase, a number, and a symbol.</div>
+                </div>
+                <div>
+                  <label htmlFor="confirm-new-password" className="form-label">Confirm new password</label>
+                  <input id="confirm-new-password" name="confirmPassword" type="password" className="form-control"
+                    autoComplete="new-password" required value={form.confirmPassword} onChange={updateForm} />
+                </div>
+              </div>
+              <div className="modal-footer">
+                <button type="button" className="btn btn-outline-secondary" onClick={onClose}>Cancel</button>
+                <button type="submit" className="btn btn-primary" disabled={submitting}>
+                  {submitting ? 'Saving...' : 'Change password'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
     </>
   );
 }
@@ -714,6 +1025,8 @@ function Layout() {
   const [menu, setMenu] = useState(false);
   const [q, setQ] = useState('');
   const [unread, setUnread] = useState(0);
+  const [assistantOpen, setAssistantOpen] = useState(false);
+  const [changePasswordOpen, setChangePasswordOpen] = useState(false);
 
   useEffect(() => {
     setOpen(false);
@@ -737,6 +1050,11 @@ function Layout() {
         .sidebar .nav-link.active{background:#0b3d91;color:#fff}
         .main{margin-left:230px}
         .bg-orange{background:#fd7e14!important;color:#fff}
+        .sb-ai-widget{position:fixed;left:auto;right:16px;bottom:16px;z-index:1080}
+        .sb-ai-widget-panel{width:380px;max-width:calc(100vw - 88px);margin-bottom:12px}
+        .sb-ai-widget-button{display:grid;place-items:center;width:58px;height:58px;border:0;border-radius:50%;color:#fff;background:#16824b;box-shadow:0 6px 20px rgba(0,0,0,.24);font-size:25px}
+        .sb-ai-widget-button:hover,.sb-ai-widget-button:focus-visible{background:#11623b}
+        @media(max-width:767px){.sb-ai-widget{left:auto;right:8px;bottom:8px}.sb-ai-widget-panel{width:calc(100vw - 88px);max-width:calc(100vw - 88px)}}
         @media(max-width:767px){.sidebar{transform:translateX(-100%)}.sidebar.open{transform:none}.main{margin-left:0}}
       `}</style>
 
@@ -774,6 +1092,8 @@ function Layout() {
               <div className="card position-absolute end-0 mt-1 p-2" style={{ minWidth: 200, zIndex: 1040 }}>
                 <div className="px-2 small text-secondary">{user.email}</div>
                 <div className="px-2 mb-2"><span className="badge bg-primary">{user.role}</span></div>
+                <button className="btn btn-sm btn-outline-primary mb-2"
+                  onClick={() => { setMenu(false); setChangePasswordOpen(true); }}>Change password</button>
                 <button className="btn btn-sm btn-outline-secondary" onClick={logout}>Log out</button>
               </div>
             )}
@@ -790,6 +1110,19 @@ function Layout() {
           <Outlet />
         </main>
       </div>
+      <div className="sb-ai-widget">
+        {assistantOpen && (
+          <div className="sb-ai-widget-panel" role="dialog" aria-label="SmartBiz AI Assistant">
+            <SmartBizAssistant compact onClose={() => setAssistantOpen(false)} />
+          </div>
+        )}
+        <button type="button" className="sb-ai-widget-button"
+          aria-label={`${assistantOpen ? 'Close' : 'Open'} SmartBiz AI Assistant`}
+          aria-expanded={assistantOpen} onClick={() => setAssistantOpen((currentOpen) => !currentOpen)}>
+          <i className={`bi ${assistantOpen ? 'bi-x-lg' : 'bi-stars'}`} aria-hidden="true"></i>
+        </button>
+      </div>
+      {changePasswordOpen && <ChangePasswordModal onClose={() => setChangePasswordOpen(false)} />}
     </div>
   );
 }
@@ -1205,16 +1538,16 @@ const Suppliers = () => (
 );
 
 function Team() {
-    const [form, setForm] = useState({ name: '', email: '', password: '', role: 'STAFF' });
+    const [form, setForm] = useState({ email: '', role: 'STAFF' });
     const [saving, setSaving] = useState(false);
 
     const handleSubmit = async (event) => {
       event.preventDefault();
       setSaving(true);
       try {
-        await api.post('/auth/register', form);
-        toast.success(`${form.name} was added to your team.`);
-        setForm({ name: '', email: '', password: '', role: 'STAFF' });
+        const { data } = await api.post('/auth/invitations', form);
+        toast.success(data.message);
+        setForm({ email: '', role: 'STAFF' });
       } catch (err) {
         toast.error(getErrorMessage(err));
       } finally {
@@ -1225,26 +1558,15 @@ function Team() {
     return (
       <>
         <div className="mb-3">
-          <h1 className="h4 mb-1">Team accounts</h1>
-          <p className="text-secondary mb-0">Create employee accounts and assign their access level.</p>
+          <h1 className="h4 mb-1">Team invitations</h1>
+          <p className="text-secondary mb-0">Invite employees to create their own account with the access level you assign.</p>
         </div>
         <div className="card border-0 shadow-sm p-3 p-md-4" style={{ maxWidth: 680 }}>
           <form onSubmit={handleSubmit}>
             <div className="mb-3">
-              <label htmlFor="team-name" className="form-label">Full name</label>
-              <input id="team-name" className="form-control" value={form.name} maxLength={100} required
-                onChange={(event) => setForm({ ...form, name: event.target.value })} />
-            </div>
-            <div className="mb-3">
               <label htmlFor="team-email" className="form-label">Email</label>
               <input id="team-email" type="email" className="form-control" value={form.email} maxLength={150} required
                 onChange={(event) => setForm({ ...form, email: event.target.value })} />
-            </div>
-            <div className="mb-3">
-              <label htmlFor="team-password" className="form-label">Temporary password</label>
-              <input id="team-password" type="password" className="form-control" value={form.password} minLength={8} required
-                onChange={(event) => setForm({ ...form, password: event.target.value })} />
-              <div className="form-text">Use at least 8 characters with uppercase, lowercase, a number, and a symbol.</div>
             </div>
             <div className="mb-4">
               <label htmlFor="team-role" className="form-label">Role</label>
@@ -1256,7 +1578,7 @@ function Team() {
               </select>
             </div>
             <button type="submit" className="btn btn-primary" disabled={saving}>
-              {saving ? 'Creating account...' : 'Create employee account'}
+              {saving ? 'Sending invitation...' : 'Send invitation'}
             </button>
           </form>
         </div>
@@ -2070,6 +2392,358 @@ function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
   );
 }
 
+const VOICE_LANGUAGES = [
+  ['en-US', 'English'],
+  ['hi-IN', 'हिन्दी'],
+  ['ta-IN', 'தமிழ்'],
+  ['te-IN', 'తెలుగు'],
+  ['kn-IN', 'ಕನ್ನಡ'],
+  ['ml-IN', 'മലയാളം'],
+];
+
+const VOICE_SPEECH = {
+  'en-US': { received: 'You have received', units: 'units of', expiry: 'Expiry date', missing: 'not provided', confirm: 'Please review and confirm.' },
+  'hi-IN': { received: 'आपको प्राप्त हुए', units: 'पैकेट', expiry: 'समाप्ति तिथि', missing: 'नहीं दी गई', confirm: 'कृपया जानकारी की जाँच करके पुष्टि करें।' },
+  'ta-IN': { received: 'நீங்கள் பெற்றது', units: 'அலகுகள்', expiry: 'காலாவதி தேதி', missing: 'வழங்கப்படவில்லை', confirm: 'சரிபார்த்து உறுதிப்படுத்தவும்.' },
+  'te-IN': { received: 'మీరు స్వీకరించినవి', units: 'యూనిట్లు', expiry: 'గడువు తేదీ', missing: 'ఇవ్వలేదు', confirm: 'దయచేసి పరిశీలించి నిర్ధారించండి.' },
+  'kn-IN': { received: 'ನೀವು ಸ್ವೀಕರಿಸಿದ್ದು', units: 'ಘಟಕಗಳು', expiry: 'ಮುಕ್ತಾಯ ದಿನಾಂಕ', missing: 'ನೀಡಲಾಗಿಲ್ಲ', confirm: 'ದಯವಿಟ್ಟು ಪರಿಶೀಲಿಸಿ ದೃಢೀಕರಿಸಿ.' },
+  'ml-IN': { received: 'നിങ്ങൾ സ്വീകരിച്ചത്', units: 'യൂണിറ്റുകൾ', expiry: 'കാലാവധി തീയതി', missing: 'നൽകിയിട്ടില്ല', confirm: 'പരിശോധിച്ച് സ്ഥിരീകരിക്കുക.' },
+};
+
+function VoiceInventoryAssistant({ onClose, onManual, onSaved }) {
+  const [language, setLanguage] = useState(() => {
+    const saved = localStorage.getItem('smartbiz-voice-language');
+    return VOICE_LANGUAGES.some(([code]) => code === saved) ? saved : 'en-US';
+  });
+  const [transcript, setTranscript] = useState('');
+  const [recording, setRecording] = useState(false);
+  const [extracting, setExtracting] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [items, setItems] = useState([]);
+  const [extractionSource, setExtractionSource] = useState('');
+  const [reviewed, setReviewed] = useState(false);
+  const recognitionRef = useRef(null);
+  const candidateSearchRef = useRef({});
+
+  useEffect(() => () => {
+    if (recognitionRef.current) recognitionRef.current.stop();
+    window.speechSynthesis?.cancel();
+  }, []);
+
+  const changeLanguage = (event) => {
+    const nextLanguage = event.target.value;
+    setLanguage(nextLanguage);
+    localStorage.setItem('smartbiz-voice-language', nextLanguage);
+  };
+
+  const startRecording = () => {
+    setError('');
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Recognition) {
+      setError('Speech recognition is not available in this browser. Type the delivery details or use manual inventory entry.');
+      return;
+    }
+    try {
+      const recognition = new Recognition();
+      recognition.lang = language;
+      recognition.interimResults = true;
+      recognition.continuous = false;
+      recognition.onresult = (event) => {
+        const words = Array.from(event.results).map((result) => result[0].transcript).join(' ');
+        setTranscript(words);
+      };
+      recognition.onerror = (event) => {
+        const errors = {
+          'not-allowed': 'Microphone permission was denied. Allow microphone access or type the delivery details.',
+          'service-not-allowed': 'Microphone access is blocked by the browser. Type the delivery details or use manual entry.',
+          'no-speech': 'No speech was detected. Try again or type the delivery details.',
+          network: 'Speech recognition could not reach its service. Check your connection or type the details.',
+          'audio-capture': 'No microphone was found. Connect a microphone or type the delivery details.',
+        };
+        setError(errors[event.error] || 'Speech recognition failed. Try again or type the delivery details.');
+        setRecording(false);
+      };
+      recognition.onend = () => setRecording(false);
+      recognitionRef.current = recognition;
+      recognition.start();
+      setRecording(true);
+    } catch (recognitionError) {
+      setError(recognitionError.name === 'NotAllowedError'
+        ? 'Microphone permission was denied. Allow microphone access or type the delivery details.'
+        : 'Unable to start speech recognition. Check microphone permissions or type the details.');
+      setRecording(false);
+    }
+  };
+
+  const extract = async (event) => {
+    event.preventDefault();
+    setExtracting(true);
+    setError('');
+    setReviewed(false);
+    try {
+      const response = await api.post('/inventory/voice/preview', { transcript, language });
+      setItems(response.data.items);
+      setExtractionSource(response.data.source);
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setExtracting(false);
+    }
+  };
+
+  const updateItem = (index, field, value) => {
+    setItems((current) => current.map((item, itemIndex) => {
+      if (itemIndex !== index) return item;
+      if (field === 'product_name') {
+        return {
+          ...item,
+          product_name: value,
+          product_id: null,
+          candidates: [],
+          match_confidence: 'none',
+          product_name_too_long: false,
+        };
+      }
+      return {
+        ...item,
+        [field]: value,
+        ...(field === 'brand' ? { brand_too_long: false } : {}),
+      };
+    }));
+    setReviewed(false);
+  };
+
+  const searchProducts = async (index, name) => {
+    const requestId = (candidateSearchRef.current[index] || 0) + 1;
+    candidateSearchRef.current[index] = requestId;
+    if (name.trim().length < 2) {
+      setItems((current) => current.map((item, itemIndex) => itemIndex === index
+        ? { ...item, candidates: [] }
+        : item));
+      return;
+    }
+    try {
+      const response = await api.get('/products', { params: { search: name.trim(), status: 'ACTIVE', limit: 20 } });
+      if (requestId !== candidateSearchRef.current[index]) return;
+      setItems((current) => current.map((item, itemIndex) => itemIndex === index && item.product_name === name
+        ? {
+          ...item,
+          candidates: response.data.data.map((product) => ({
+            id: product.id,
+            name: product.name,
+            brand: product.brand,
+            supplier_name: product.supplier_name,
+            sku: product.sku,
+            current_stock: product.current_stock,
+          })),
+          match_confidence: response.data.data.length ? 'low' : 'none',
+        }
+        : item));
+    } catch (err) {
+      if (requestId === candidateSearchRef.current[index]) setError(getErrorMessage(err));
+    }
+  };
+
+  const duplicateIndices = new Set();
+  const seenProducts = new Set();
+  items.forEach((item, index) => {
+    const keys = [
+      item.product_id ? `product:${item.product_id}` : '',
+      String(item.product_name || '').trim().toLocaleLowerCase(),
+    ].filter(Boolean);
+    if (keys.some((key) => seenProducts.has(key))) duplicateIndices.add(index);
+    keys.forEach((key) => {
+      if (seenProducts.has(key)) duplicateIndices.add(index);
+      seenProducts.add(key);
+    });
+  });
+  const validItems = items.length > 0 && items.every((item) =>
+    Number.isInteger(Number(item.product_id)) && Number(item.product_id) > 0
+    && Number.isInteger(Number(item.quantity)) && Number(item.quantity) > 0 && Number(item.quantity) <= 1000000
+    && (!item.expiry_date || /^\d{4}-\d{2}-\d{2}$/.test(item.expiry_date))
+  ) && duplicateIndices.size === 0;
+
+  const readBack = () => {
+    if (!window.speechSynthesis || !window.SpeechSynthesisUtterance) {
+      setError('Text-to-speech is not available in this browser.');
+      return;
+    }
+    const words = VOICE_SPEECH[language];
+    const dateFormatter = new Intl.DateTimeFormat(language, { month: 'long', year: 'numeric' });
+    const text = items.map((item) => {
+      const expiry = item.expiry_date
+        ? dateFormatter.format(new Date(`${item.expiry_date}T12:00:00`))
+        : words.missing;
+      return `${words.received} ${item.quantity || '?'} ${words.units} ${item.product_name || 'unknown product'}. ${words.expiry}: ${expiry}.`;
+    }).join(' ') + ` ${words.confirm}`;
+    const utterance = new window.SpeechSynthesisUtterance(text);
+    utterance.lang = language;
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(utterance);
+  };
+
+  const confirm = async () => {
+    setSaving(true);
+    setError('');
+    try {
+      await api.post('/inventory/voice/confirm', {
+        confirmed: true,
+        items: items.map((item) => ({
+          product_id: Number(item.product_id),
+          quantity: Number(item.quantity),
+          expiry_date: item.expiry_date || null,
+        })),
+      });
+      onSaved();
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal title="Voice stock assistant" onClose={onClose} size="lg">
+      <div className="mb-3">
+        <label htmlFor="voice-language" className="form-label">Preferred language</label>
+        <select id="voice-language" className="form-select" value={language} onChange={changeLanguage}>
+          {VOICE_LANGUAGES.map(([code, label]) => <option key={code} value={code}>{label}</option>)}
+        </select>
+      </div>
+      <form onSubmit={extract}>
+        <label htmlFor="voice-transcript" className="form-label">Recognized speech preview — edit before extraction</label>
+        <textarea id="voice-transcript" className="form-control mb-2" rows="3" maxLength="5000"
+          value={transcript} onChange={(event) => setTranscript(event.target.value)}
+          placeholder="For example: Received 20 packets of Britannia biscuits, expiry December 2027." />
+        <div className="d-flex flex-wrap gap-2">
+          <button type="button" className={`btn ${recording ? 'btn-danger' : 'btn-outline-primary'}`}
+            onClick={recording ? () => recognitionRef.current?.stop() : startRecording} disabled={extracting || saving}>
+            {recording
+              ? <><span className="spinner-grow spinner-grow-sm me-2" aria-hidden="true"></span>Stop recording</>
+              : <><i className="bi bi-mic-fill me-1" aria-hidden="true"></i>Record delivery</>}
+          </button>
+          <button className="btn btn-primary" disabled={extracting || saving || !transcript.trim()}>
+            {extracting ? 'Extracting...' : 'Review extracted stock'}
+          </button>
+          <button type="button" className="btn btn-link" onClick={onManual}>Use manual inventory entry</button>
+        </div>
+      </form>
+
+      {error && <div className="alert alert-danger mt-3 mb-0" role="alert">{error}</div>}
+
+      {items.length > 0 && (
+        <div className="mt-4">
+          {extractionSource === 'offline' && (
+            <div className="alert alert-info py-2" role="status">
+              Offline extraction uses simple receipt phrases and supported quantity units only. Verify every field carefully.
+            </div>
+          )}
+          <div className="d-flex justify-content-between align-items-center gap-2 mb-2">
+            <h3 className="h6 mb-0">Review before saving — nothing is saved yet</h3>
+            <button type="button" className="btn btn-sm btn-outline-secondary" onClick={readBack}>
+              <i className="bi bi-volume-up me-1" aria-hidden="true"></i>Read back
+            </button>
+          </div>
+          {items.map((item, index) => {
+            const warnings = item.warnings.filter((warning) => {
+              if (item.product_id && warning.includes('Product match is uncertain')) return false;
+              if (item.product_id && warning.startsWith('Brand does not match')) return false;
+              if (item.product_name && warning === 'Product name is missing.') return false;
+              if (!item.product_name_too_long && warning === 'Product name is too long. Correct it before confirming.') return false;
+              if (!item.brand_too_long && warning === 'Brand name is too long. Correct it before confirming.') return false;
+              if (item.quantity && warning === 'Quantity is missing or invalid.') return false;
+              if (item.expiry_date && warning.includes('expiry date')) return false;
+              if ((item.product_id || item.candidates.length > 0) && warning.startsWith('No matching product was found')) return false;
+              if (warning.startsWith('Possible duplicate of')) return false;
+              return true;
+            });
+            const duplicated = duplicateIndices.has(index);
+            return (
+              <div className="card mb-3" key={`${index}-${item.product_name}`}>
+                <div className="card-body">
+                  <div className="d-flex justify-content-between align-items-center mb-3">
+                    <span className={`badge ${item.match_confidence === 'high' ? 'bg-success' : 'bg-warning text-dark'}`}>
+                      {item.product_id ? 'Selected shop product' : item.match_confidence === 'high' ? 'High catalog match' : 'Review product match'}
+                    </span>
+                    <button type="button" className="btn btn-sm btn-outline-danger" aria-label={`Remove product ${index + 1}`}
+                      onClick={() => { setItems((current) => current.filter((_, itemIndex) => itemIndex !== index)); setReviewed(false); }}>
+                      <i className="bi bi-trash" aria-hidden="true"></i>
+                    </button>
+                  </div>
+                  <div className="row g-3">
+                    <div className="col-md-6">
+                      <label className="form-label" htmlFor={`voice-product-${index}`}>Product mentioned</label>
+                      <input id={`voice-product-${index}`} className="form-control" value={item.product_name || ''}
+                        maxLength="150" onChange={(event) => {
+                          const name = event.target.value;
+                          updateItem(index, 'product_name', name);
+                          searchProducts(index, name);
+                        }} />
+                    </div>
+                    <div className="col-md-6">
+                      <label className="form-label" htmlFor={`voice-match-${index}`}>Shop product</label>
+                      <select id={`voice-match-${index}`} className="form-select" value={item.product_id || ''}
+                        onChange={(event) => updateItem(index, 'product_id', event.target.value ? Number(event.target.value) : null)}>
+                        <option value="">Select a product</option>
+                        {item.candidates.map((candidate) => (
+                          <option key={candidate.id} value={candidate.id}>
+                            {candidate.name}{candidate.brand ? ` — ${candidate.brand}` : ''}
+                            {candidate.supplier_name ? `, supplier ${candidate.supplier_name}` : ''} ({candidate.sku}, stock {candidate.current_stock})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="col-md-3">
+                      <label className="form-label" htmlFor={`voice-quantity-${index}`}>Received quantity</label>
+                      <input id={`voice-quantity-${index}`} type="number" min="1" max="1000000" step="1" className="form-control"
+                        value={item.quantity ?? ''} onChange={(event) => updateItem(index, 'quantity', event.target.value === '' ? null : Number(event.target.value))} />
+                    </div>
+                    <div className="col-md-5">
+                      <label className="form-label" htmlFor={`voice-expiry-${index}`}>Expiry date (optional)</label>
+                      <input id={`voice-expiry-${index}`} type="date" className="form-control" value={item.expiry_date || ''}
+                        onChange={(event) => updateItem(index, 'expiry_date', event.target.value || null)} />
+                    </div>
+                    <div className="col-md-4">
+                      <label className="form-label" htmlFor={`voice-brand-${index}`}>Brand heard</label>
+                      <input id={`voice-brand-${index}`} className="form-control" value={item.brand || ''}
+                        maxLength="100" onChange={(event) => updateItem(index, 'brand', event.target.value)} />
+                    </div>
+                  </div>
+                  {(warnings.length > 0 || !item.expiry_date || duplicated) && (
+                    <div className="alert alert-warning py-2 mt-3 mb-0">
+                      <strong>Check before confirming:</strong>
+                      <ul className="mb-0 mt-1">
+                        {warnings.map((warning, warningIndex) => <li key={warningIndex}>{warning}</li>)}
+                        {!item.expiry_date && <li>Expiry date was not provided. Confirm that no expiry date needs recording.</li>}
+                        {duplicated && <li>Possible duplicate product entry. Remove or correct one entry before confirming.</li>}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+          <div className="form-check mb-3">
+            <input id="voice-reviewed" className="form-check-input" type="checkbox" checked={reviewed}
+              onChange={(event) => setReviewed(event.target.checked)} />
+            <label htmlFor="voice-reviewed" className="form-check-label">
+              I reviewed every field and confirmed any missing or uncertain information is correct.
+            </label>
+          </div>
+          <div className="d-flex justify-content-end gap-2">
+            <button type="button" className="btn btn-outline-secondary" onClick={onClose} disabled={saving}>Cancel</button>
+            <button type="button" className="btn btn-success" onClick={confirm}
+              disabled={saving || !reviewed || !validItems}>
+              {saving ? 'Saving stock...' : 'Confirm and receive stock'}
+            </button>
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
 function Inventory() {
   const { user } = useAuth();
   const canAdjust = ['ADMIN', 'MANAGER', 'STAFF'].includes(user.role);
@@ -2078,6 +2752,7 @@ function Inventory() {
   const [page, setPage] = useState(1);
   const [adjust, setAdjust] = useState(false);
   const [receive, setReceive] = useState(false);
+  const [voice, setVoice] = useState(false);
   const isTx = tab === 'transactions';
   const list = useApi(
     isTx ? '/inventory/transactions' : '/products',
@@ -2098,6 +2773,12 @@ function Inventory() {
           </div>
         )}
       </div>
+      {canAdjust && (
+        <button type="button" className="btn btn-primary position-fixed bottom-0 start-0 m-4 rounded-pill shadow"
+          style={{ zIndex: 1040 }} onClick={() => setVoice(true)}>
+          <i className="bi bi-mic-fill me-2" aria-hidden="true"></i>Voice stock
+        </button>
+      )}
 
       {s && (
         <div className="row g-3 mb-4">
@@ -2127,17 +2808,24 @@ function Inventory() {
               <table className="table table-hover align-middle mb-0">
                 <thead className="table-light"><tr><th>Date</th><th>Product</th><th>Type</th><th>Change</th><th>Stock after</th><th>Note</th><th>By</th></tr></thead>
                 <tbody>
-                  {rows.map((t) => (
-                    <tr key={t.id}>
-                      <td className="text-nowrap">{fmtDate(t.created_at)}</td>
-                      <td>{t.product_name}<div className="small text-secondary">{t.sku}</div></td>
-                      <td><span className={`badge bg-${TX_COLORS[t.type]}`}>{t.type.replace('_', ' ')}</span></td>
-                      <td className={t.quantity_change > 0 ? 'text-success fw-semibold' : 'text-danger fw-semibold'}>{t.quantity_change > 0 ? '+' : ''}{t.quantity_change}</td>
-                      <td>{t.stock_after}</td>
-                      <td>{t.note || '-'}</td>
-                      <td>{t.user_name || '-'}</td>
-                    </tr>
-                  ))}
+                  {rows.map((t) => {
+                    const transactionType = typeof t.type === 'string' && t.type.trim() ? t.type : null;
+                    return (
+                      <tr key={t.id}>
+                        <td className="text-nowrap">{fmtDate(t.created_at)}</td>
+                        <td>{t.product_name}<div className="small text-secondary">{t.sku}</div></td>
+                        <td>
+                          <span className={`badge bg-${TX_COLORS[transactionType] || 'secondary'}`}>
+                            {transactionType ? transactionType.replace('_', ' ') : 'Unknown type'}
+                          </span>
+                        </td>
+                        <td className={t.quantity_change > 0 ? 'text-success fw-semibold' : 'text-danger fw-semibold'}>{t.quantity_change > 0 ? '+' : ''}{t.quantity_change}</td>
+                        <td>{t.stock_after}</td>
+                        <td>{t.note || '-'}</td>
+                        <td>{t.user_name || '-'}</td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             ) : (
@@ -2165,6 +2853,11 @@ function Inventory() {
 
       {adjust && <AdjustModal onClose={() => setAdjust(false)} onDone={() => { setAdjust(false); summary.reload(); list.reload(); }} />}
       {receive && <ReceiveStockModal onClose={() => setReceive(false)} onDone={() => { setReceive(false); summary.reload(); list.reload(); }} canCreateProduct={MANAGERS.includes(user.role)} />}
+      {voice && <VoiceInventoryAssistant
+        onClose={() => setVoice(false)}
+        onManual={() => { setVoice(false); setReceive(true); }}
+        onSaved={() => { setVoice(false); summary.reload(); list.reload(); toast.success('Confirmed voice stock updates saved.'); }}
+      />}
     </>
   );
 }
@@ -2258,6 +2951,7 @@ function App() {
       <Route path="/login" element={<Login />} />
       <Route path="/forgot-password" element={<ForgotPassword />} />
       <Route path="/register" element={<Register />} />
+      <Route path="/accept-invitation" element={<AcceptInvitation />} />
       <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
         <Route path="/dashboard" element={<Dashboard />} />
         <Route path="/assistant" element={<SmartBizAssistant />} />

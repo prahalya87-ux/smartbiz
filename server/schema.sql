@@ -10,12 +10,58 @@ CREATE TABLE IF NOT EXISTS users (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   name VARCHAR(100) NOT NULL,
   email VARCHAR(150) NOT NULL UNIQUE,
+  phone VARCHAR(20),
   password_hash VARCHAR(255) NOT NULL,
   role_id TINYINT UNSIGNED NOT NULL,
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   FOREIGN KEY (role_id) REFERENCES roles(id)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS shops (
+  id CHAR(36) PRIMARY KEY,
+  shop_code VARCHAR(20) NOT NULL UNIQUE,
+  shop_name VARCHAR(150) NOT NULL,
+  shop_type ENUM('Grocery','Kirana','Supermarket','Medical','Clothing','Electronics','Other') NOT NULL,
+  address VARCHAR(255) NOT NULL,
+  country VARCHAR(100) NOT NULL,
+  state VARCHAR(100) NOT NULL,
+  city VARCHAR(100) NOT NULL,
+  area VARCHAR(100) NOT NULL,
+  pincode VARCHAR(20) NOT NULL,
+  latitude DECIMAL(10,7),
+  longitude DECIMAL(10,7),
+  owner_id INT UNSIGNED,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (owner_id) REFERENCES users(id)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS shop_members (
+  id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  user_id INT UNSIGNED NOT NULL,
+  shop_id CHAR(36) NOT NULL,
+  role ENUM('ADMIN','MANAGER','CASHIER','STAFF') NOT NULL,
+  status ENUM('ACTIVE','INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_shop_member (user_id, shop_id),
+  INDEX idx_shop_members_shop (shop_id, status),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (shop_id) REFERENCES shops(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS invitations (
+  id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  shop_id CHAR(36) NOT NULL,
+  email VARCHAR(150) NOT NULL,
+  assigned_role ENUM('MANAGER','CASHIER','STAFF') NOT NULL,
+  invitation_token_hash CHAR(64) NOT NULL UNIQUE,
+  expires_at BIGINT NOT NULL,
+  accepted_at TIMESTAMP NULL,
+  status ENUM('PENDING','ACCEPTED','EXPIRED','CANCELLED') NOT NULL DEFAULT 'PENDING',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_invitations_shop_email (shop_id, email, status),
+  FOREIGN KEY (shop_id) REFERENCES shops(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS password_reset_codes (
@@ -29,43 +75,50 @@ CREATE TABLE IF NOT EXISTS password_reset_codes (
 
 CREATE TABLE IF NOT EXISTS categories (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-  name VARCHAR(100) NOT NULL UNIQUE,
+  shop_id CHAR(36),
+  name VARCHAR(100) NOT NULL,
   description VARCHAR(255),
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_categories_shop_name (shop_id, name)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS suppliers (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  shop_id CHAR(36),
   name VARCHAR(100) NOT NULL,
   company_name VARCHAR(150),
   phone VARCHAR(20) NOT NULL,
-  email VARCHAR(150) UNIQUE,
+  email VARCHAR(150),
   address VARCHAR(255),
   tax_number VARCHAR(50),
   status ENUM('ACTIVE','INACTIVE') NOT NULL DEFAULT 'ACTIVE',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  INDEX idx_suppliers_name (name)
+  INDEX idx_suppliers_name (name),
+  UNIQUE KEY uq_suppliers_shop_email (shop_id, email)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS customers (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  shop_id CHAR(36),
   name VARCHAR(100) NOT NULL,
   phone VARCHAR(20) NOT NULL,
-  email VARCHAR(150) UNIQUE,
+  email VARCHAR(150),
   address VARCHAR(255),
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   INDEX idx_customers_name (name),
-  INDEX idx_customers_phone (phone)
+  INDEX idx_customers_phone (phone),
+  UNIQUE KEY uq_customers_shop_email (shop_id, email)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS products (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  shop_id CHAR(36),
   name VARCHAR(150) NOT NULL,
-  sku VARCHAR(50) NOT NULL UNIQUE,
-  barcode VARCHAR(50) UNIQUE,
+  sku VARCHAR(50) NOT NULL,
+  barcode VARCHAR(50),
   category_id INT UNSIGNED NOT NULL,
   supplier_id INT UNSIGNED,
   brand VARCHAR(100),
@@ -84,12 +137,15 @@ CREATE TABLE IF NOT EXISTS products (
   FOREIGN KEY (category_id) REFERENCES categories(id),
   FOREIGN KEY (supplier_id) REFERENCES suppliers(id) ON DELETE SET NULL,
   INDEX idx_products_name (name),
-  INDEX idx_products_expiry (expiry_date)
+  INDEX idx_products_expiry (expiry_date),
+  UNIQUE KEY uq_products_shop_sku (shop_id, sku),
+  UNIQUE KEY uq_products_shop_barcode (shop_id, barcode)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS purchases (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-  invoice_number VARCHAR(50) NOT NULL UNIQUE,
+  shop_id CHAR(36),
+  invoice_number VARCHAR(50) NOT NULL,
   supplier_id INT UNSIGNED NOT NULL,
   created_by INT UNSIGNED NOT NULL,
   purchase_date DATE NOT NULL,
@@ -104,7 +160,8 @@ CREATE TABLE IF NOT EXISTS purchases (
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   FOREIGN KEY (supplier_id) REFERENCES suppliers(id),
   FOREIGN KEY (created_by) REFERENCES users(id),
-  INDEX idx_purchases_date (purchase_date)
+  INDEX idx_purchases_date (purchase_date),
+  UNIQUE KEY uq_purchases_shop_invoice (shop_id, invoice_number)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS purchase_items (
@@ -121,7 +178,8 @@ CREATE TABLE IF NOT EXISTS purchase_items (
 
 CREATE TABLE IF NOT EXISTS sales (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-  invoice_number VARCHAR(50) NOT NULL UNIQUE,
+  shop_id CHAR(36),
+  invoice_number VARCHAR(50) NOT NULL,
   customer_id INT UNSIGNED,
   cashier_id INT UNSIGNED NOT NULL,
   subtotal DECIMAL(12,2) NOT NULL,
@@ -136,7 +194,8 @@ CREATE TABLE IF NOT EXISTS sales (
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE SET NULL,
   FOREIGN KEY (cashier_id) REFERENCES users(id),
-  INDEX idx_sales_date (created_at)
+  INDEX idx_sales_date (created_at),
+  UNIQUE KEY uq_sales_shop_invoice (shop_id, invoice_number)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS sale_items (
@@ -190,6 +249,7 @@ CREATE TABLE IF NOT EXISTS return_items (
 
 CREATE TABLE IF NOT EXISTS stock_transactions (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  shop_id CHAR(36),
   product_id INT UNSIGNED NOT NULL,
   type ENUM('PURCHASE','SALE','RETURN','DAMAGE','MANUAL_ADJUSTMENT') NOT NULL,
   quantity_change INT NOT NULL,
@@ -206,6 +266,7 @@ CREATE TABLE IF NOT EXISTS stock_transactions (
 
 CREATE TABLE IF NOT EXISTS notifications (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  shop_id CHAR(36),
   type ENUM('LOW_STOCK','OUT_OF_STOCK','EXPIRING','EXPIRED','SUPPLIER_PAYMENT','ACTION_REQUIRED','INFO') NOT NULL,
   severity ENUM('CRITICAL','WARNING','NORMAL','INFO') NOT NULL DEFAULT 'INFO',
   message VARCHAR(255) NOT NULL,
@@ -218,6 +279,7 @@ CREATE TABLE IF NOT EXISTS notifications (
 
 CREATE TABLE IF NOT EXISTS audit_logs (
   id INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  shop_id CHAR(36),
   user_id INT UNSIGNED,
   action VARCHAR(50) NOT NULL,
   entity VARCHAR(50) NOT NULL,

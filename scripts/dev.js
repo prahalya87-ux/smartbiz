@@ -1,6 +1,9 @@
 // Starts Vite; its dev-only plugin starts and stops the SmartBiz API server.
 // Usage: npm run dev [-- --host 127.0.0.1 --port 5173]
 // Host and port arguments are forwarded to Vite.
+// Starts Vite; the client dev plugin starts and stops the SmartBiz API server.
+// Usage: npm run dev [-- --host 127.0.0.1 --port 5173]
+// Host and port arguments are forwarded to Vite.
 const { spawn } = require('child_process');
 const path = require('path');
 
@@ -20,6 +23,7 @@ const children = [
   spawn(process.execPath, [viteBin, '--host', host, '--port', port], {
     cwd: path.join(root, 'client'),
     stdio: 'inherit',
+    env: { ...process.env, NODE_ENV: process.env.NODE_ENV || 'development' },
   }),
 ];
 

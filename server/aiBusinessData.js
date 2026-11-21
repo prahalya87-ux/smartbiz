@@ -57,7 +57,9 @@ const dateClause = (column, range) => range.start
   ? { sql: `${column} >= ? AND ${column} < ?`, params: [range.start, range.end] }
   : { sql: '1 = 1', params: [] };
 
-function createAiBusinessData(pool, clock = () => new Date()) {
+function createAiBusinessData(pool, clock = () => new Date(), shopId = null) {
+  const shopClause = (alias) => shopId ? `${alias}.shop_id = ? AND ` : '';
+  const scopedParams = (params = []) => (shopId ? [shopId, ...params] : params);
   const definitions = [
     {
       name: 'get_inventory',
@@ -80,8 +82,8 @@ function createAiBusinessData(pool, clock = () => new Date()) {
           || !['any', 'expired', 'expiring'].includes(expiry_status)) {
           throw Object.assign(new Error('Invalid product search.'), { status: 400 });
         }
-        const clauses = ["p.status = 'ACTIVE'"];
-        const params = [];
+        const clauses = [`${shopId ? 'p.shop_id = ? AND ' : ''}p.status = 'ACTIVE'`];
+        const params = shopId ? [shopId] : [];
         const today = localDate(clock());
         if (out_of_stock_only) clauses.push('p.current_stock = 0');
         else if (low_stock_only) clauses.push('p.current_stock <= p.min_stock_level');
@@ -135,13 +137,14 @@ function createAiBusinessData(pool, clock = () => new Date()) {
                     (si.quantity - si.returned_quantity)), 0)
                   FROM sale_items si WHERE si.sale_id = s.id) / s.subtotal
                  ELSE 0 END ELSE 0 END), 0) END` : 'NULL'} AS gross_profit
-           FROM sales s WHERE ${filter.sql}`,
-          filter.params
+           FROM sales s WHERE ${shopClause('s')}${filter.sql}`,
+          scopedParams(filter.params)
         );
         const [[returns]] = await pool.query(
           `SELECT COALESCE(SUM(r.refund_amount), 0) AS refunds
-           FROM returns r JOIN sales s ON s.id = r.sale_id WHERE ${filter.sql}`,
-          filter.params
+           FROM returns r JOIN sales s ON s.id = r.sale_id
+           WHERE ${shopClause('s')}${filter.sql}`,
+          scopedParams(filter.params)
         );
         const hasIncompleteSales = summary.net_merchandise_revenue_excluding_tax === null;
         const result = {
@@ -193,8 +196,8 @@ function createAiBusinessData(pool, clock = () => new Date()) {
           const [[summary]] = await pool.query(
             `SELECT COUNT(CASE WHEN status <> 'RETURNED' THEN 1 END) AS sale_count,
                COALESCE(SUM(CASE WHEN status <> 'RETURNED' THEN final_amount ELSE 0 END), 0) AS billed_sales_value_including_tax
-             FROM sales WHERE ${filter.sql}`,
-            filter.params
+             FROM sales WHERE ${shopId ? 'shop_id = ? AND ' : ''}${filter.sql}`,
+            scopedParams(filter.params)
           );
           return {
             period,
@@ -247,11 +250,11 @@ function createAiBusinessData(pool, clock = () => new Date()) {
                ELSE 0 END), 0) AS net_revenue_excluding_tax
            FROM products p
            LEFT JOIN sale_items si ON si.product_id = p.id
-           LEFT JOIN sales s ON s.id = si.sale_id AND ${filter.sql}
-           WHERE p.name LIKE ? OR p.sku LIKE ?
+           LEFT JOIN sales s ON s.id = si.sale_id ${shopId ? 'AND s.shop_id = p.shop_id' : ''} AND ${filter.sql}
+           WHERE ${shopClause('p')}(p.name LIKE ? OR p.sku LIKE ?)
            GROUP BY p.id, p.name, p.sku
            ORDER BY p.name LIMIT 20`,
-          [...filter.params, `%${search.trim()}%`, `%${search.trim()}%`]
+          [...filter.params, ...(shopId ? [shopId] : []), `%${search.trim()}%`, `%${search.trim()}%`]
         );
         return { period, products, truncated: products.length === 20, currency: 'INR' };
       },
@@ -278,17 +281,17 @@ function createAiBusinessData(pool, clock = () => new Date()) {
                CASE WHEN s.subtotal > 0 THEN (s.subtotal - s.discount) / s.subtotal ELSE 0 END) AS net_revenue_excluding_tax,
              SUM(si.quantity - si.returned_quantity) AS units_sold
            FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN products p ON p.id = si.product_id
-           WHERE ${filter.sql} AND s.status <> 'RETURNED'
+           WHERE ${shopClause('s')}${shopClause('p')}${filter.sql} AND s.status <> 'RETURNED'
            GROUP BY p.id, p.name, p.sku
            HAVING units_sold > 0
            ORDER BY net_revenue_excluding_tax DESC LIMIT ?`,
-          [...filter.params, limit]
+          [...(shopId ? [shopId, shopId] : []), ...filter.params, limit]
         );
         const [[incomplete]] = await pool.query(
           `SELECT COUNT(*) AS sales_missing_item_details FROM sales s
-           WHERE ${filter.sql} AND s.status <> 'RETURNED'
+           WHERE ${shopClause('s')}${filter.sql} AND s.status <> 'RETURNED'
              AND NOT EXISTS (SELECT 1 FROM sale_items si WHERE si.sale_id = s.id)`,
-          filter.params
+          scopedParams(filter.params)
         );
         return {
           period,
@@ -325,11 +328,11 @@ function createAiBusinessData(pool, clock = () => new Date()) {
              SUM(si.unit_price * (si.quantity - si.returned_quantity) *
                CASE WHEN s.subtotal > 0 THEN (s.subtotal - s.discount) / s.subtotal ELSE 0 END) AS net_revenue_excluding_tax
            FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN products p ON p.id = si.product_id
-           WHERE ${filter.sql} AND s.status <> 'RETURNED'
+           WHERE ${shopClause('s')}${shopClause('p')}${filter.sql} AND s.status <> 'RETURNED'
            GROUP BY p.id, p.name, p.sku
            HAVING units_sold > 0
            ORDER BY units_sold ${order}, p.name ASC LIMIT ?`,
-          [...filter.params, limit]
+          [...(shopId ? [shopId, shopId] : []), ...filter.params, limit]
         );
         return { period, direction, products: rows, currency: 'INR' };
       },
@@ -345,8 +348,12 @@ function createAiBusinessData(pool, clock = () => new Date()) {
         }
         const openBalance = `s.final_amount - s.amount_paid -
           COALESCE((SELECT SUM(r.refund_amount) FROM returns r WHERE r.sale_id = s.id), 0)`;
-        const clauses = [`(${openBalance}) > 0`, "s.status <> 'RETURNED'"];
-        const params = [];
+        const clauses = [
+          ...(shopId ? ['s.shop_id = ?', 'c.shop_id = s.shop_id'] : []),
+          `(${openBalance}) > 0`,
+          "s.status <> 'RETURNED'",
+        ];
+        const params = shopId ? [shopId] : [];
         if (search) { clauses.push('c.name LIKE ?'); params.push(`%${search}%`); }
         const [rows] = await pool.query(
           `SELECT c.name, COUNT(s.id) AS outstanding_sales,
@@ -358,7 +365,9 @@ function createAiBusinessData(pool, clock = () => new Date()) {
         );
         const [[unlinked]] = await pool.query(
           `SELECT COUNT(*) AS outstanding_sales, COALESCE(SUM(${openBalance}), 0) AS outstanding_amount
-           FROM sales s WHERE s.customer_id IS NULL AND (${openBalance}) > 0 AND s.status <> 'RETURNED'`
+           FROM sales s WHERE ${shopId ? 's.shop_id = ? AND ' : ''}s.customer_id IS NULL
+             AND (${openBalance}) > 0 AND s.status <> 'RETURNED'`,
+          shopId ? [shopId] : []
         );
         return {
           customers: rows,
@@ -381,22 +390,22 @@ function createAiBusinessData(pool, clock = () => new Date()) {
           `SELECT COUNT(*) AS purchase_count, COALESCE(SUM(total_amount), 0) AS total_purchase_value,
              COALESCE(SUM(amount_paid), 0) AS amount_paid,
              COALESCE(SUM(total_amount - amount_paid), 0) AS outstanding_amount
-           FROM purchases p WHERE ${filter.sql}`,
-          filter.params
+           FROM purchases p WHERE ${shopClause('p')}${filter.sql}`,
+          scopedParams(filter.params)
         );
         const [items] = await pool.query(
           `SELECT pr.name, pr.sku, SUM(pi.quantity) AS units_purchased
            FROM purchase_items pi JOIN purchases p ON p.id = pi.purchase_id
            JOIN products pr ON pr.id = pi.product_id
-           WHERE ${filter.sql}
+           WHERE ${shopClause('p')}${shopId ? 'pr.shop_id = p.shop_id AND ' : ''}${filter.sql}
            GROUP BY pr.id, pr.name, pr.sku ORDER BY units_purchased DESC LIMIT 10`,
-          filter.params
+          scopedParams(filter.params)
         );
         const [[incomplete]] = await pool.query(
           `SELECT COUNT(*) AS purchases_missing_item_details FROM purchases p
-           WHERE ${filter.sql}
+           WHERE ${shopClause('p')}${filter.sql}
              AND NOT EXISTS (SELECT 1 FROM purchase_items pi WHERE pi.purchase_id = p.id)`,
-          filter.params
+          scopedParams(filter.params)
         );
         return {
           period,
@@ -416,8 +425,11 @@ function createAiBusinessData(pool, clock = () => new Date()) {
         if (typeof search !== 'string' || search.length > 100) {
           throw Object.assign(new Error('Invalid supplier search.'), { status: 400 });
         }
-        const clauses = ['p.total_amount > p.amount_paid'];
-        const params = [];
+        const clauses = [
+          ...(shopId ? ['p.shop_id = ?', 's.shop_id = p.shop_id'] : []),
+          'p.total_amount > p.amount_paid',
+        ];
+        const params = shopId ? [shopId] : [];
         if (search) { clauses.push('s.name LIKE ?'); params.push(`%${search}%`); }
         const [rows] = await pool.query(
           `SELECT s.name, COUNT(p.id) AS outstanding_purchases,
@@ -440,31 +452,37 @@ function createAiBusinessData(pool, clock = () => new Date()) {
         const filter = dateClause('r.created_at', range);
         const [[summary]] = await pool.query(
           `SELECT COUNT(*) AS return_count, COALESCE(SUM(r.refund_amount), 0) AS refunds
-           FROM returns r WHERE ${filter.sql}`,
-          filter.params
+           FROM returns r JOIN sales s ON s.id = r.sale_id
+           WHERE ${shopClause('s')}${filter.sql}`,
+          scopedParams(filter.params)
         );
         const [[units]] = await pool.query(
           `SELECT COALESCE(SUM(ri.quantity), 0) AS returned_units
-           FROM return_items ri JOIN returns r ON r.id = ri.return_id WHERE ${filter.sql}`,
-          filter.params
+           FROM return_items ri JOIN returns r ON r.id = ri.return_id
+           JOIN sales s ON s.id = r.sale_id WHERE ${shopClause('s')}${filter.sql}`,
+          scopedParams(filter.params)
         );
         const [[incomplete]] = await pool.query(
           `SELECT COUNT(*) AS returns_missing_item_details FROM returns r
-           WHERE ${filter.sql} AND NOT EXISTS (SELECT 1 FROM return_items ri WHERE ri.return_id = r.id)`,
-          filter.params
+           JOIN sales s ON s.id = r.sale_id
+           WHERE ${shopClause('s')}${filter.sql}
+             AND NOT EXISTS (SELECT 1 FROM return_items ri WHERE ri.return_id = r.id)`,
+          scopedParams(filter.params)
         );
         const [resolutions] = await pool.query(
           `SELECT r.resolution, COUNT(DISTINCT r.id) AS return_count
-           FROM returns r WHERE ${filter.sql} GROUP BY r.resolution`,
-          filter.params
+           FROM returns r JOIN sales s ON s.id = r.sale_id
+           WHERE ${shopClause('s')}${filter.sql} GROUP BY r.resolution`,
+          scopedParams(filter.params)
         );
         const [products] = await pool.query(
           `SELECT p.name, p.sku, SUM(ri.quantity) AS returned_units
            FROM return_items ri JOIN returns r ON r.id = ri.return_id
+           JOIN sales s ON s.id = r.sale_id
            JOIN products p ON p.id = ri.product_id
-           WHERE ${filter.sql} GROUP BY p.id, p.name, p.sku
+           WHERE ${shopClause('s')}${shopId ? 'p.shop_id = s.shop_id AND ' : ''}${filter.sql} GROUP BY p.id, p.name, p.sku
            ORDER BY returned_units DESC LIMIT 10`,
-          filter.params
+          scopedParams(filter.params)
         );
         return {
           period,
@@ -501,9 +519,13 @@ function createAiBusinessData(pool, clock = () => new Date()) {
                        WHEN purchase_id IS NOT NULL THEN 'purchases' ELSE 'unlinked' END AS payment_type,
              method, COUNT(*) AS payment_count, SUM(amount) AS payment_amount
            FROM payments WHERE ${filter.sql}
+             ${shopId ? `AND (
+               (sale_id IS NOT NULL AND EXISTS (SELECT 1 FROM sales s WHERE s.id = payments.sale_id AND s.shop_id = ?))
+               OR (purchase_id IS NOT NULL AND EXISTS (SELECT 1 FROM purchases p WHERE p.id = payments.purchase_id AND p.shop_id = ?))
+             )` : ''}
              AND (? = 'all' OR (? = 'sales' AND sale_id IS NOT NULL) OR (? = 'purchases' AND purchase_id IS NOT NULL))
            GROUP BY payment_type, method ORDER BY payment_type, payment_amount DESC`,
-          [...filter.params, payment_type, payment_type, payment_type]
+          [...filter.params, ...(shopId ? [shopId, shopId] : []), payment_type, payment_type, payment_type]
         );
         return { period, payments: rows, currency: 'INR' };
       },
@@ -526,12 +548,12 @@ function createAiBusinessData(pool, clock = () => new Date()) {
           throw Object.assign(new Error('Only Admins and Managers can view supplier information.'), { status: 403 });
         }
         const [rows] = await pool.query(
-          `SELECT name FROM ${entity} WHERE name LIKE ? ORDER BY name LIMIT 20`,
-          [`%${search}%`]
+          `SELECT name FROM ${entity} WHERE ${shopId ? 'shop_id = ? AND ' : ''}name LIKE ? ORDER BY name LIMIT 20`,
+          shopId ? [shopId, `%${search}%`] : [`%${search}%`]
         );
         const [[count]] = await pool.query(
-          `SELECT COUNT(*) AS total_count FROM ${entity} WHERE name LIKE ?`,
-          [`%${search}%`]
+          `SELECT COUNT(*) AS total_count FROM ${entity} WHERE ${shopId ? 'shop_id = ? AND ' : ''}name LIKE ?`,
+          shopId ? [shopId, `%${search}%`] : [`%${search}%`]
         );
         return {
           entity,
@@ -557,10 +579,10 @@ function createAiBusinessData(pool, clock = () => new Date()) {
         }
         const [rows] = await pool.query(
           `SELECT p.name, p.sku, s.name AS supplier_name
-           FROM products p LEFT JOIN suppliers s ON s.id = p.supplier_id
-           WHERE p.name LIKE ? OR p.sku LIKE ?
+           FROM products p LEFT JOIN suppliers s ON s.id = p.supplier_id ${shopId ? 'AND s.shop_id = p.shop_id' : ''}
+           WHERE ${shopClause('p')}(p.name LIKE ? OR p.sku LIKE ?)
            ORDER BY p.name LIMIT 20`,
-          [`%${search.trim()}%`, `%${search.trim()}%`]
+          [...(shopId ? [shopId] : []), `%${search.trim()}%`, `%${search.trim()}%`]
         );
         return { products: rows, truncated: rows.length === 20 };
       },
@@ -575,29 +597,31 @@ function createAiBusinessData(pool, clock = () => new Date()) {
         const [products] = await pool.query(
           `SELECT COUNT(*) AS total_products, COALESCE(SUM(current_stock), 0) AS total_units,
              COALESCE(SUM(current_stock = 0), 0) AS out_of_stock
-           FROM products WHERE status = 'ACTIVE'`
+           FROM products WHERE ${shopId ? 'shop_id = ? AND ' : ''}status = 'ACTIVE'`,
+          shopId ? [shopId] : []
         );
         const [sales] = await pool.query(
           `SELECT substr(created_at, 1, 7) AS month, SUM(final_amount) AS amount
-           FROM sales WHERE created_at >= ? AND status <> 'RETURNED' GROUP BY month ORDER BY month`,
-          [range.start]
+           FROM sales WHERE ${shopId ? 'shop_id = ? AND ' : ''}created_at >= ? AND status <> 'RETURNED' GROUP BY month ORDER BY month`,
+          shopId ? [shopId, range.start] : [range.start]
         );
         const [purchases] = await pool.query(
           `SELECT substr(purchase_date, 1, 7) AS month, SUM(total_amount) AS amount
-           FROM purchases WHERE purchase_date >= ? GROUP BY month ORDER BY month`,
-          [range.start]
+           FROM purchases WHERE ${shopId ? 'shop_id = ? AND ' : ''}purchase_date >= ? GROUP BY month ORDER BY month`,
+          shopId ? [shopId, range.start] : [range.start]
         );
         const [lowStock] = await pool.query(
           `SELECT sku, name, current_stock, min_stock_level FROM products
-           WHERE status = 'ACTIVE' AND current_stock <= min_stock_level
-           ORDER BY current_stock ASC LIMIT 10`
+           WHERE ${shopId ? 'shop_id = ? AND ' : ''}status = 'ACTIVE' AND current_stock <= min_stock_level
+           ORDER BY current_stock ASC LIMIT 10`,
+          shopId ? [shopId] : []
         );
         const [topSelling] = await pool.query(
           `SELECT p.name, SUM(si.quantity - si.returned_quantity) AS units_sold
            FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN products p ON p.id = si.product_id
-           WHERE s.created_at >= ? AND s.status <> 'RETURNED'
+           WHERE ${shopClause('s')}${shopClause('p')}s.created_at >= ? AND s.status <> 'RETURNED'
            GROUP BY p.id, p.name HAVING units_sold > 0 ORDER BY units_sold DESC LIMIT 5`,
-          [range.start]
+          [...(shopId ? [shopId, shopId] : []), range.start]
         );
         return {
           products: products[0],

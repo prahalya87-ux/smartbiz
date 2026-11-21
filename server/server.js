@@ -9,7 +9,7 @@ const { DatabaseSync } = require('node:sqlite');
 const mysql = require('mysql2/promise');
 const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
-const { createHash } = require('node:crypto');
+const { createHash, randomBytes, randomUUID } = require('node:crypto');
 const path = require('path');
 const multer = require('multer');
 const fs = require('fs');
@@ -17,6 +17,14 @@ const { createAiBusinessData } = require('./aiBusinessData');
 const { answerLocalQuestion } = require('./aiLocalAssistant');
 const { isSupportedBarcode, lookupBarcode } = require('./barcodeCatalog');
 const { getMysqlSslOptions } = require('./mysqlSsl');
+const { ensureTenantSchema } = require('./tenantSchema');
+const {
+  LANGUAGE_CODES: VOICE_LANGUAGES,
+  extractVoiceInventory,
+  isValidDate,
+  matchCatalogItems,
+  validateConfirmationItems,
+} = require('./voiceInventory');
 const {
   PASSWORD_RESET_CODE_TTL_MS,
   PASSWORD_RESET_MAX_ATTEMPTS,
@@ -171,15 +179,6 @@ const pool = {
   end: async () => { if (mysqlPool) await mysqlPool.end(); },
 };
 
-let sqliteRegistrationTail = Promise.resolve();
-async function lockSqliteRegistration() {
-  let release;
-  const previous = sqliteRegistrationTail;
-  sqliteRegistrationTail = new Promise((resolve) => { release = resolve; });
-  await previous;
-  return release;
-}
-
 const TODAY_SQL = useMysql ? 'CURDATE()' : "date('now','localtime')";
 const NEXT_30_DAYS_SQL = useMysql ? 'DATE_ADD(CURDATE(), INTERVAL 30 DAY)' : "date('now','localtime','+30 days')";
 const SIX_MONTHS_AGO_SQL = useMysql
@@ -202,11 +201,11 @@ async function initializeDatabase() {
 
 }
 // ---------- Helpers ----------
-const logAction = async (userId, action, entity, entityId, details, ip) => {
+const logAction = async (userId, action, entity, entityId, details, ip, shopId = null) => {
   try {
     await pool.query(
-      'INSERT INTO audit_logs (user_id, action, entity, entity_id, details, ip_address) VALUES (?,?,?,?,?,?)',
-      [userId, action, entity, entityId || null, details ? JSON.stringify(details) : null, ip || null]
+      'INSERT INTO audit_logs (shop_id, user_id, action, entity, entity_id, details, ip_address) VALUES (?,?,?,?,?,?,?)',
+      [shopId, userId, action, entity, entityId || null, details ? JSON.stringify(details) : null, ip || null]
     );
   } catch (err) {
     console.error('Audit log failed:', err.message); // never break the request
@@ -214,7 +213,7 @@ const logAction = async (userId, action, entity, entityId, details, ip) => {
 };
 
 const signToken = (user) =>
-  jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, {
+  jwt.sign({ id: user.id, shopId: user.shop_id }, process.env.JWT_SECRET, {
     expiresIn: process.env.JWT_EXPIRES_IN || '8h',
   });
 
@@ -234,9 +233,14 @@ const authenticate = async (req, res, next) => {
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
     const [rows] = await pool.query(
-      `SELECT u.id, u.name, u.email, u.is_active, r.name AS role
-       FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?`,
-      [payload.id]
+      `SELECT u.id, u.name, u.email, u.is_active, sm.shop_id, sm.role,
+         s.shop_code, s.shop_name
+       FROM users u
+       JOIN shop_members sm ON sm.user_id = u.id AND sm.status = 'ACTIVE'
+       JOIN shops s ON s.id = sm.shop_id
+       WHERE u.id = ? AND (? IS NULL OR sm.shop_id = ?)
+       ORDER BY sm.created_at, sm.id LIMIT 1`,
+      [payload.id, payload.shopId || null, payload.shopId || null]
     );
     const user = rows[0];
     if (!user || !user.is_active) return res.status(401).json({ message: 'Account not found or disabled.' });
@@ -269,6 +273,14 @@ const signupLimiter = rateLimit({
   message: { message: 'Too many account creation attempts. Please try again later.' },
 });
 
+const changePasswordLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many password change attempts. Please try again later.' },
+});
+
 const aiChatLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   max: 20,
@@ -278,6 +290,15 @@ const aiChatLimiter = rateLimit({
   handler: (req, res) => res.status(429).json({
     message: 'AI chat request limit reached. Please wait a few minutes and try again.',
   }),
+});
+
+const voiceInventoryLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 10,
+  keyGenerator: (req) => `user:${req.user.id}`,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Voice extraction limit reached. Please wait a few minutes and try again.' },
 });
 
 const passwordResetRequestIpLimiter = rateLimit({
@@ -352,15 +373,26 @@ app.post(
     try {
       const { email, password } = req.body;
       const [rows] = await pool.query(
-        `SELECT u.id, u.name, u.email, u.password_hash, u.is_active, r.name AS role
-         FROM users u JOIN roles r ON r.id = u.role_id WHERE u.email = ?`,
+        `SELECT u.id, u.name, u.email, u.password_hash, u.is_active,
+           sm.shop_id, sm.role, s.shop_code, s.shop_name
+         FROM users u
+         JOIN shop_members sm ON sm.user_id = u.id AND sm.status = 'ACTIVE'
+         JOIN shops s ON s.id = sm.shop_id
+         WHERE u.email = ?
+         ORDER BY sm.created_at, sm.id LIMIT 1`,
         [email]
       );
       const user = rows[0];
       const ok = user && user.is_active && (await bcrypt.compare(password, user.password_hash));
       if (!ok) return res.status(401).json({ message: 'Invalid email or password.' }); // same message for both cases
-      await logAction(user.id, 'LOGIN', 'user', user.id, null, req.ip);
-      res.json({ token: signToken(user), user: { id: user.id, name: user.name, email: user.email, role: user.role } });
+      await logAction(user.id, 'LOGIN', 'user', user.id, null, req.ip, user.shop_id);
+      res.json({
+        token: signToken(user),
+        user: {
+          id: user.id, name: user.name, email: user.email, role: user.role,
+          shop_id: user.shop_id, shop_code: user.shop_code, shop_name: user.shop_name,
+        },
+      });
     } catch (err) {
       next(err);
     }
@@ -500,7 +532,11 @@ app.post(
         return res.status(400).json({ message: 'The reset code is invalid or expired. Request a new code and try again.' });
       }
 
-      await logAction(resetUserId, 'PASSWORD_RESET', 'user', resetUserId, null, req.ip);
+      const [[membership]] = await pool.query(
+        "SELECT shop_id FROM shop_members WHERE user_id = ? AND status = 'ACTIVE' ORDER BY created_at, id LIMIT 1",
+        [resetUserId]
+      );
+      await logAction(resetUserId, 'PASSWORD_RESET', 'user', resetUserId, null, req.ip, membership?.shop_id);
       return res.json({ message: 'Password updated. You can now sign in with your new password.' });
     } catch (err) {
       if (inTransaction) await conn.rollback();
@@ -516,43 +552,75 @@ app.post(
   signupLimiter,
   body('name').trim().notEmpty().isLength({ max: 100 }).withMessage('Name is required and must be 100 characters or fewer.'),
   body('email').trim().toLowerCase().isEmail().isLength({ max: 150 }).withMessage('Please enter a valid email address (maximum 150 characters).'),
+  body('phone').trim().matches(/^[+0-9() .-]{7,20}$/).withMessage('Enter a valid phone number.'),
   body('password')
     .isStrongPassword({ minLength: 8, minLowercase: 1, minUppercase: 1, minNumbers: 1, minSymbols: 1 })
     .withMessage('Password must be 8+ characters with uppercase, lowercase, number and symbol.'),
+  body('shopName').trim().notEmpty().isLength({ max: 150 }).withMessage('Shop name is required and must be 150 characters or fewer.'),
+  body('shopType').isIn(['Grocery', 'Kirana', 'Supermarket', 'Medical', 'Clothing', 'Electronics', 'Other'])
+    .withMessage('Choose a valid shop type.'),
+  body('address').trim().notEmpty().isLength({ max: 255 }).withMessage('Enter the shop address (maximum 255 characters).'),
+  body('country').trim().notEmpty().isLength({ max: 100 }).withMessage('Country is required.'),
+  body('state').trim().notEmpty().isLength({ max: 100 }).withMessage('State is required.'),
+  body('city').trim().notEmpty().isLength({ max: 100 }).withMessage('City is required.'),
+  body('area').trim().notEmpty().isLength({ max: 100 }).withMessage('Area or locality is required.'),
+  body('pincode').trim().notEmpty().isLength({ max: 20 }).withMessage('PIN code is required.'),
+  body('latitude').optional().isFloat({ min: -90, max: 90 }).withMessage('Latitude must be between -90 and 90.'),
+  body('longitude').optional().isFloat({ min: -180, max: 180 }).withMessage('Longitude must be between -180 and 180.'),
   validate,
   async (req, res, next) => {
     let conn;
-    let releaseRegistrationLock;
     let inTransaction = false;
     try {
-      if (!useMysql) releaseRegistrationLock = await lockSqliteRegistration();
       conn = await pool.getConnection();
-      const { name, email, password } = req.body;
+      const {
+        name, email, phone, password, shopName, shopType, address,
+        country, state, city, area, pincode, latitude, longitude,
+      } = req.body;
       const passwordHash = await bcrypt.hash(password, 10);
       await conn.beginImmediateTransaction();
       inTransaction = true;
 
-      // Serialize account creation in MySQL as well as SQLite so only one signup can claim Admin.
-      await conn.query(
-        useMysql ? "SELECT id FROM roles WHERE name = 'ADMIN' FOR UPDATE" : "SELECT id FROM roles WHERE name = 'ADMIN'"
-      );
-      const [[userCount]] = await conn.query('SELECT COUNT(*) AS count FROM users');
-      const role = Number(userCount.count) === 0 ? 'ADMIN' : 'STAFF';
-      const [[roleRow]] = await conn.query('SELECT id FROM roles WHERE name = ?', [role]);
+      const [[roleRow]] = await conn.query("SELECT id FROM roles WHERE name = 'ADMIN'");
       const [existing] = await conn.query('SELECT id FROM users WHERE email = ?', [email]);
       if (existing.length) {
         throw Object.assign(new Error('This email is already registered.'), { status: 409 });
       }
 
       const [result] = await conn.query(
-        'INSERT INTO users (name, email, password_hash, role_id, is_active) VALUES (?,?,?,?,1)',
-        [name, email, passwordHash, roleRow.id]
+        'INSERT INTO users (name, email, phone, password_hash, role_id, is_active) VALUES (?,?,?,?,?,1)',
+        [name, email, phone, passwordHash, roleRow.id]
+      );
+      const shopId = randomUUID();
+      let shopCode;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const candidate = `SBZ-${randomBytes(3).toString('hex').toUpperCase()}`;
+        const [matches] = await conn.query('SELECT id FROM shops WHERE shop_code = ?', [candidate]);
+        if (!matches.length) {
+          shopCode = candidate;
+          break;
+        }
+      }
+      if (!shopCode) throw httpError(503, 'Could not generate a unique shop code. Please try again.');
+      await conn.query(
+        `INSERT INTO shops
+          (id, shop_code, shop_name, shop_type, address, country, state, city, area, pincode, latitude, longitude, owner_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [shopId, shopCode, shopName, shopType, address, country, state, city, area, pincode,
+          latitude === undefined ? null : Number(latitude), longitude === undefined ? null : Number(longitude), result.insertId]
+      );
+      await conn.query(
+        'INSERT INTO shop_members (user_id, shop_id, role, status) VALUES (?,?,?,?)',
+        [result.insertId, shopId, 'ADMIN', 'ACTIVE']
       );
       await conn.commit();
       inTransaction = false;
 
-      const user = { id: result.insertId, name, email, role };
-      await logAction(user.id, 'REGISTER', 'user', user.id, { role }, req.ip);
+      const user = {
+        id: result.insertId, name, email, phone, role: 'ADMIN',
+        shop_id: shopId, shop_code: shopCode, shop_name: shopName,
+      };
+      await logAction(user.id, 'REGISTER', 'shop', null, { shop_code: shopCode }, req.ip, shopId);
       res.status(201).json({ token: signToken(user), user });
     } catch (err) {
       if (inTransaction) await conn.rollback();
@@ -563,41 +631,169 @@ app.post(
       next(err);
     } finally {
       if (conn) await conn.release();
-      if (releaseRegistrationLock) releaseRegistrationLock();
     }
   }
 );
 
-// Admin-only: create a user
 app.post(
-  '/api/auth/register',
+  '/api/auth/invitations',
   authenticate,
   authorize('ADMIN'),
-  body('name').trim().notEmpty().withMessage('Name is required.'),
-  body('email').trim().toLowerCase().isEmail().withMessage('Please enter a valid email.'),
+  body('email').trim().toLowerCase().isEmail().isLength({ max: 150 }).withMessage('Enter a valid employee email address.'),
+  body('role').isIn(['MANAGER', 'CASHIER', 'STAFF']).withMessage('Choose Manager, Cashier, or Staff.'),
+  validate,
+  async (req, res, next) => {
+    if (!mailTransport) {
+      return res.status(503).json({ message: 'Employee invitations require email delivery to be configured.' });
+    }
+
+    let conn;
+    let inTransaction = false;
+    try {
+      const email = req.body.email.trim().toLowerCase();
+      const [existingUsers] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
+      if (existingUsers.length) return res.status(409).json({ message: 'This email already has a SmartBiz account.' });
+
+      const token = randomBytes(32).toString('base64url');
+      const tokenHash = createHash('sha256').update(token).digest('hex');
+      const expiresAt = Date.now() + (7 * 24 * 60 * 60 * 1000);
+      conn = await pool.getConnection();
+      await conn.beginImmediateTransaction();
+      inTransaction = true;
+      await conn.query(
+        `UPDATE invitations SET status = 'CANCELLED'
+         WHERE shop_id = ? AND email = ? AND status = 'PENDING'`,
+        [req.user.shop_id, email]
+      );
+      await conn.query(
+        `INSERT INTO invitations (shop_id, email, assigned_role, invitation_token_hash, expires_at)
+         VALUES (?,?,?,?,?)`,
+        [req.user.shop_id, email, req.body.role, tokenHash, expiresAt]
+      );
+      await conn.commit();
+      inTransaction = false;
+
+      const clientOrigin = process.env.CLIENT_ORIGIN || 'http://localhost:5173';
+      const invitationUrl = new URL('/accept-invitation', clientOrigin).toString() + `?token=${encodeURIComponent(token)}`;
+      try {
+        await mailTransport.sendMail({
+          from: smtpFrom,
+          to: email,
+          subject: `Invitation to join ${req.user.shop_name} on SmartBiz`,
+          text: `You have been invited to join ${req.user.shop_name} as ${req.body.role}. Accept this invitation within 7 days: ${invitationUrl}`,
+          html: `<p>You have been invited to join <strong>${req.user.shop_name}</strong> as <strong>${req.body.role}</strong>.</p><p><a href="${invitationUrl}">Accept invitation</a></p><p>This link expires in 7 days and can only be used once.</p>`,
+        });
+      } catch (mailError) {
+        await pool.query(
+          `UPDATE invitations SET status = 'CANCELLED'
+           WHERE invitation_token_hash = ? AND status = 'PENDING'`,
+          [tokenHash]
+        );
+        console.error('Employee invitation email delivery failed:', mailError.message);
+        throw httpError(503, 'The invitation email could not be delivered. Please try again later.');
+      }
+
+      await logAction(req.user.id, 'INVITE', 'user', null, { email, role: req.body.role }, req.ip, req.user.shop_id);
+      return res.status(201).json({ message: `Invitation sent to ${email}.` });
+    } catch (err) {
+      if (inTransaction) await conn.rollback();
+      return next(err);
+    } finally {
+      if (conn) await conn.release();
+    }
+  }
+);
+
+app.get('/api/auth/invitations/:token', async (req, res, next) => {
+  try {
+    const tokenHash = createHash('sha256').update(String(req.params.token || '')).digest('hex');
+    const [rows] = await pool.query(
+      `SELECT i.email, i.assigned_role, i.expires_at, s.shop_name
+       FROM invitations i JOIN shops s ON s.id = i.shop_id
+       WHERE i.invitation_token_hash = ? AND i.status = 'PENDING'`,
+      [tokenHash]
+    );
+    const invitation = rows[0];
+    if (!invitation || Number(invitation.expires_at) <= Date.now()) {
+      return res.status(404).json({ message: 'This invitation is invalid or has expired. Ask the shop Admin for a new invitation.' });
+    }
+    return res.json({
+      email: invitation.email,
+      role: invitation.assigned_role,
+      shop_name: invitation.shop_name,
+      expires_at: Number(invitation.expires_at),
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+app.post(
+  '/api/auth/accept-invitation',
+  body('token').isString().isLength({ min: 32, max: 100 }).withMessage('Invitation token is invalid.'),
+  body('name').trim().notEmpty().isLength({ max: 100 }).withMessage('Name is required.'),
   body('password')
     .isStrongPassword({ minLength: 8, minLowercase: 1, minUppercase: 1, minNumbers: 1, minSymbols: 1 })
     .withMessage('Password must be 8+ characters with uppercase, lowercase, number and symbol.'),
-  body('role').isIn(['MANAGER', 'CASHIER', 'STAFF']).withMessage('Admins can assign Manager, Cashier, or Staff roles.'),
   validate,
   async (req, res, next) => {
+    let conn;
+    let inTransaction = false;
     try {
-      const { name, email, password, role } = req.body;
-      if (email === req.user.email) {
-        return res.status(409).json({ message: 'You cannot change your own role.' });
-      }
-      const [[roleRow]] = await pool.query('SELECT id FROM roles WHERE name = ?', [role]);
-      const [dup] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
-      if (dup[0]) return res.status(409).json({ message: 'This email is already registered.' });
-      const hash = await bcrypt.hash(password, 10);
-      const [result] = await pool.query(
-        'INSERT INTO users (name, email, password_hash, role_id, is_active) VALUES (?,?,?,?,1)',
-        [name, email, hash, roleRow.id]
+      const tokenHash = createHash('sha256').update(req.body.token).digest('hex');
+      conn = await pool.getConnection();
+      await conn.beginImmediateTransaction();
+      inTransaction = true;
+      const [rows] = await conn.query(
+        `SELECT i.id, i.shop_id, i.email, i.assigned_role, i.expires_at, s.shop_name, s.shop_code
+         FROM invitations i JOIN shops s ON s.id = i.shop_id
+         WHERE i.invitation_token_hash = ? AND i.status = 'PENDING'${useMysql ? ' FOR UPDATE' : ''}`,
+        [tokenHash]
       );
-      await logAction(req.user.id, 'CREATE', 'user', result.insertId, { email, role }, req.ip);
-      res.status(201).json({ message: 'User created successfully.', id: result.insertId });
+      const invitation = rows[0];
+      if (!invitation || Number(invitation.expires_at) <= Date.now()) {
+        if (invitation) await conn.query("UPDATE invitations SET status = 'EXPIRED' WHERE id = ?", [invitation.id]);
+        await conn.commit();
+        inTransaction = false;
+        return res.status(400).json({ message: 'This invitation is invalid or has expired. Ask the shop Admin for a new invitation.' });
+      }
+
+      const [existing] = await conn.query('SELECT id FROM users WHERE email = ?', [invitation.email]);
+      if (existing.length) throw httpError(409, 'This email already has a SmartBiz account. Ask the shop Admin for help.');
+      const [[roleRow]] = await conn.query('SELECT id FROM roles WHERE name = ?', [invitation.assigned_role]);
+      const passwordHash = await bcrypt.hash(req.body.password, 10);
+      const [result] = await conn.query(
+        'INSERT INTO users (name, email, password_hash, role_id, is_active) VALUES (?,?,?,?,1)',
+        [req.body.name, invitation.email, passwordHash, roleRow.id]
+      );
+      await conn.query(
+        'INSERT INTO shop_members (user_id, shop_id, role, status) VALUES (?,?,?,?)',
+        [result.insertId, invitation.shop_id, invitation.assigned_role, 'ACTIVE']
+      );
+      await conn.query(
+        `UPDATE invitations SET status = 'ACCEPTED', accepted_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND status = 'PENDING'`,
+        [invitation.id]
+      );
+      await conn.commit();
+      inTransaction = false;
+
+      const user = {
+        id: result.insertId, name: req.body.name, email: invitation.email,
+        role: invitation.assigned_role, shop_id: invitation.shop_id,
+        shop_code: invitation.shop_code, shop_name: invitation.shop_name,
+      };
+      await logAction(user.id, 'ACCEPT_INVITATION', 'user', user.id, { role: user.role }, req.ip, user.shop_id);
+      return res.status(201).json({ token: signToken(user), user });
     } catch (err) {
-      next(err);
+      if (inTransaction) await conn.rollback();
+      if (err.code === 'ER_DUP_ENTRY' && !err.status) {
+        err.status = 409;
+        err.message = 'This email or invitation was already used.';
+      }
+      return next(err);
+    } finally {
+      if (conn) await conn.release();
     }
   }
 );
@@ -605,9 +801,65 @@ app.post(
 app.get('/api/auth/me', authenticate, (req, res) => res.json({ user: req.user }));
 
 app.post('/api/auth/logout', authenticate, async (req, res) => {
-  await logAction(req.user.id, 'LOGOUT', 'user', req.user.id, null, req.ip);
+  await logAction(req.user.id, 'LOGOUT', 'user', req.user.id, null, req.ip, req.user.shop_id);
   res.json({ message: 'Logged out successfully.' });
 });
+
+app.post(
+  '/api/auth/change-password',
+  authenticate,
+  changePasswordLimiter,
+  body('currentPassword').isString().notEmpty().withMessage('Enter your current password.'),
+  body('newPassword')
+    .isStrongPassword({ minLength: 8, minLowercase: 1, minUppercase: 1, minNumbers: 1, minSymbols: 1 })
+    .withMessage('New password must be 8+ characters with uppercase, lowercase, number and symbol.'),
+  validate,
+  async (req, res, next) => {
+    let conn;
+    let inTransaction = false;
+    try {
+      conn = await pool.getConnection();
+      await conn.beginImmediateTransaction();
+      inTransaction = true;
+      const [rows] = await conn.query(
+        `SELECT password_hash, is_active FROM users WHERE id = ?${useMysql ? ' FOR UPDATE' : ''}`,
+        [req.user.id]
+      );
+      const account = rows[0];
+      if (!account || !account.is_active) {
+        await conn.rollback();
+        inTransaction = false;
+        return res.status(401).json({ message: 'Account not found or disabled.' });
+      }
+      if (!(await bcrypt.compare(req.body.currentPassword, account.password_hash))) {
+        await conn.rollback();
+        inTransaction = false;
+        return res.status(400).json({ message: 'Current password is incorrect.' });
+      }
+      if (await bcrypt.compare(req.body.newPassword, account.password_hash)) {
+        await conn.rollback();
+        inTransaction = false;
+        return res.status(400).json({ message: 'Choose a new password different from your current password.' });
+      }
+
+      const passwordHash = await bcrypt.hash(req.body.newPassword, 10);
+      await conn.query(
+        'UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        [passwordHash, req.user.id]
+      );
+      await conn.query('DELETE FROM password_reset_codes WHERE user_id = ?', [req.user.id]);
+      await conn.commit();
+      inTransaction = false;
+      await logAction(req.user.id, 'PASSWORD_CHANGE', 'user', req.user.id, null, req.ip, req.user.shop_id);
+      return res.json({ message: 'Password changed successfully.' });
+    } catch (err) {
+      if (inTransaction) await conn.rollback();
+      return next(err);
+    } finally {
+      if (conn) await conn.release();
+    }
+  }
+);
 
 // ================= PHASE 3: categories, suppliers, products, inventory =================
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -651,7 +903,7 @@ app.post(
   validate,
   wrap(async (req, res) => {
     try {
-      const businessData = createAiBusinessData(pool);
+      const businessData = createAiBusinessData(pool, undefined, req.user.shop_id);
       const message = await answerLocalQuestion({
         messages: req.body.messages,
         role: req.user.role,
@@ -668,12 +920,15 @@ app.post(
 
 // Turns MySQL errors into friendly messages
 const dbError = (err, dupMsgs = {}, inUseMsg = 'This record is in use and cannot be deleted.') => {
-  if (err.code === 'ER_DUP_ENTRY') {
-    const key = Object.keys(dupMsgs).find((k) => err.sqlMessage.includes(k));
+  if (err.code === 'ER_DUP_ENTRY' || (err.code === 'ERR_SQLITE_ERROR' && /UNIQUE constraint failed/.test(err.message))) {
+    const message = err.sqlMessage || err.message || '';
+    const key = Object.keys(dupMsgs).find((k) => message.includes(k));
     throw httpError(409, dupMsgs[key] || 'A record with this value already exists.');
   }
   if (err.code === 'ER_NO_REFERENCED_ROW_2') throw httpError(400, 'Please select a valid category or supplier.');
-  if (err.code === 'ER_ROW_IS_REFERENCED_2') throw httpError(409, inUseMsg);
+  if (err.code === 'ER_ROW_IS_REFERENCED_2' || (err.code === 'ERR_SQLITE_ERROR' && /FOREIGN KEY constraint failed/.test(err.message))) {
+    throw httpError(409, inUseMsg);
+  }
   throw err;
 };
 
@@ -693,26 +948,30 @@ async function withTransaction(fn) {
 }
 
 // EVERY stock change goes through here: updates stock, blocks negatives, records a transaction
-async function changeStock(conn, productId, change, type, userId, note, refType = null, refId = null) {
-  const [[p]] = await conn.query(`SELECT current_stock FROM products WHERE id = ?${useMysql ? ' FOR UPDATE' : ''}`, [productId]);
+async function changeStock(conn, productId, change, type, userId, note, refType = null, refId = null, shopId) {
+  const [[p]] = await conn.query(
+    `SELECT current_stock FROM products WHERE id = ? AND shop_id = ?${useMysql ? ' FOR UPDATE' : ''}`,
+    [productId, shopId]
+  );
   if (!p) throw httpError(400, 'Invalid product ID.');
   const after = p.current_stock + change;
   if (after < 0) throw httpError(400, 'Quantity cannot be greater than available stock.');
-  await conn.query('UPDATE products SET current_stock = ? WHERE id = ?', [after, productId]);
+  await conn.query('UPDATE products SET current_stock = ? WHERE id = ? AND shop_id = ?', [after, productId, shopId]);
   await conn.query(
-    `INSERT INTO stock_transactions (product_id, type, quantity_change, stock_after, reference_type, reference_id, note, created_by)
-     VALUES (?,?,?,?,?,?,?,?)`,
-    [productId, type, change, after, refType, refId, note || null, userId || null]
+    `INSERT INTO stock_transactions (shop_id, product_id, type, quantity_change, stock_after, reference_type, reference_id, note, created_by)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+    [shopId, productId, type, change, after, refType, refId, note || null, userId || null]
   );
   return after;
 }
 
 // Creates alerts for low/out of stock and expiry, and clears ones that no longer apply
-async function syncAlerts() {
+async function syncAlerts(shopId) {
   const [rows] = await pool.query(
-     `SELECT id, name, current_stock, min_stock_level,
+     `SELECT id, shop_id, name, current_stock, min_stock_level,
        ${DAYS_LEFT_SQL('expiry_date')} AS days_left
-     FROM products WHERE status = 'ACTIVE'`
+     FROM products WHERE status = 'ACTIVE'${shopId ? ' AND shop_id = ?' : ''}`,
+    shopId ? [shopId] : []
   );
   for (const p of rows) {
     const alerts = [];
@@ -725,16 +984,17 @@ async function syncAlerts() {
     }
     const keep = alerts.map((a) => a[0]);
     await pool.query(
-      `DELETE FROM notifications WHERE product_id = ? AND is_read = FALSE
+      `DELETE FROM notifications WHERE shop_id = ? AND product_id = ? AND is_read = FALSE
        AND type IN ('LOW_STOCK','OUT_OF_STOCK','EXPIRING','EXPIRED') ${keep.length ? 'AND type NOT IN (?)' : ''}`,
-      keep.length ? [p.id, keep] : [p.id]
+      keep.length ? [p.shop_id, p.id, keep] : [p.shop_id, p.id]
     );
     for (const [type, severity, message] of alerts) {
       const [ex] = await pool.query(
-        'SELECT id FROM notifications WHERE product_id = ? AND type = ? AND is_read = FALSE LIMIT 1', [p.id, type]);
+        'SELECT id FROM notifications WHERE shop_id = ? AND product_id = ? AND type = ? AND is_read = FALSE LIMIT 1',
+        [p.shop_id, p.id, type]);
       if (!ex[0]) {
-        await pool.query('INSERT INTO notifications (type, severity, message, product_id) VALUES (?,?,?,?)',
-          [type, severity, message, p.id]);
+        await pool.query('INSERT INTO notifications (shop_id, type, severity, message, product_id) VALUES (?,?,?,?,?)',
+          [p.shop_id, type, severity, message, p.id]);
       }
     }
   }
@@ -765,15 +1025,19 @@ function mountCrud(route, table, fields, rules, dupMsgs, inUseMsg) {
   const pick = (b) => fields.map((f) => emptyToNull(b[f]));
 
   app.get(`/api/${route}`, authenticate, wrap(async (req, res) => {
-    const [rows] = await pool.query(`SELECT * FROM ${table} WHERE name LIKE ? ORDER BY name`, [`%${req.query.search || ''}%`]);
+    const [rows] = await pool.query(
+      `SELECT * FROM ${table} WHERE shop_id = ? AND name LIKE ? ORDER BY name`,
+      [req.user.shop_id, `%${req.query.search || ''}%`]
+    );
     res.json(rows);
   }));
 
   app.post(`/api/${route}`, authenticate, authorize(...MANAGERS), rules, validate, wrap(async (req, res) => {
     try {
       const [r] = await pool.query(
-        `INSERT INTO ${table} (${fields.join(', ')}) VALUES (${fields.map(() => '?').join(', ')})`, pick(req.body));
-      await logAction(req.user.id, 'CREATE', route, r.insertId, null, req.ip);
+        `INSERT INTO ${table} (shop_id, ${fields.join(', ')}) VALUES (?,${fields.map(() => '?').join(', ')})`,
+        [req.user.shop_id, ...pick(req.body)]);
+      await logAction(req.user.id, 'CREATE', route, r.insertId, null, req.ip, req.user.shop_id);
       res.status(201).json({ message: 'Saved successfully.', id: r.insertId });
     } catch (err) { dbError(err, dupMsgs, inUseMsg); }
   }));
@@ -781,18 +1045,19 @@ function mountCrud(route, table, fields, rules, dupMsgs, inUseMsg) {
   app.put(`/api/${route}/:id`, authenticate, authorize(...MANAGERS), rules, validate, wrap(async (req, res) => {
     try {
       const [r] = await pool.query(
-        `UPDATE ${table} SET ${fields.map((f) => `${f} = ?`).join(', ')} WHERE id = ?`, [...pick(req.body), req.params.id]);
+        `UPDATE ${table} SET ${fields.map((f) => `${f} = ?`).join(', ')} WHERE id = ? AND shop_id = ?`,
+        [...pick(req.body), req.params.id, req.user.shop_id]);
       if (!r.affectedRows) return res.status(404).json({ message: 'Record not found.' });
-      await logAction(req.user.id, 'UPDATE', route, Number(req.params.id), null, req.ip);
+      await logAction(req.user.id, 'UPDATE', route, Number(req.params.id), null, req.ip, req.user.shop_id);
       res.json({ message: 'Saved successfully.' });
     } catch (err) { dbError(err, dupMsgs, inUseMsg); }
   }));
 
   app.delete(`/api/${route}/:id`, authenticate, authorize(...MANAGERS), wrap(async (req, res) => {
     try {
-      const [r] = await pool.query(`DELETE FROM ${table} WHERE id = ?`, [req.params.id]);
+      const [r] = await pool.query(`DELETE FROM ${table} WHERE id = ? AND shop_id = ?`, [req.params.id, req.user.shop_id]);
       if (!r.affectedRows) return res.status(404).json({ message: 'Record not found.' });
-      await logAction(req.user.id, 'DELETE', route, Number(req.params.id), null, req.ip);
+      await logAction(req.user.id, 'DELETE', route, Number(req.params.id), null, req.ip, req.user.shop_id);
       res.json({ message: 'Deleted successfully.' });
     } catch (err) { dbError(err, dupMsgs, inUseMsg); }
   }));
@@ -815,7 +1080,8 @@ mountCrud('suppliers', 'suppliers',
 // ---------- Products ----------
 const PRODUCT_SELECT = `SELECT p.*, c.name AS category_name, s.name AS supplier_name,
   ${DAYS_LEFT_SQL('p.expiry_date')} AS days_left
-  FROM products p JOIN categories c ON c.id = p.category_id LEFT JOIN suppliers s ON s.id = p.supplier_id`;
+  FROM products p JOIN categories c ON c.id = p.category_id AND c.shop_id = p.shop_id
+  LEFT JOIN suppliers s ON s.id = p.supplier_id AND s.shop_id = p.shop_id`;
 
 const productRules = [
   body('name').trim().notEmpty().withMessage('Product name is required.'),
@@ -836,7 +1102,7 @@ app.get('/api/products/scan/:barcode', authenticate, wrap(async (req, res) => {
   const barcode = String(req.params.barcode || '').trim();
   if (!barcode || barcode.length > 50) throw httpError(400, 'Enter a valid product barcode.');
 
-  const [rows] = await pool.query(`${PRODUCT_SELECT} WHERE p.barcode = ? LIMIT 1`, [barcode]);
+  const [rows] = await pool.query(`${PRODUCT_SELECT} WHERE p.shop_id = ? AND p.barcode = ? LIMIT 1`, [req.user.shop_id, barcode]);
   if (rows[0]) return res.json({ product: rows[0], catalog: null });
   if (!isSupportedBarcode(barcode)) {
     throw httpError(400, 'This barcode is not in your products and is not a supported product barcode for catalog lookup.');
@@ -854,9 +1120,9 @@ app.get('/api/products', authenticate, wrap(async (req, res) => {
   const { search, category_id, supplier_id, status, alert, sort = 'name', dir = 'asc' } = req.query;
   const page = Math.max(parseInt(req.query.page) || 1, 1);
   const limit = Math.min(Math.max(parseInt(req.query.limit) || 10, 1), 200);
-  const where = [];
-  const args = [];
-  if (search) { where.push('(p.name LIKE ? OR p.sku LIKE ? OR p.barcode LIKE ?)'); const s = `%${search}%`; args.push(s, s, s); }
+  const where = ['p.shop_id = ?'];
+  const args = [req.user.shop_id];
+  if (search) { where.push('(p.name LIKE ? OR p.sku LIKE ? OR p.barcode LIKE ? OR p.brand LIKE ?)'); const s = `%${search}%`; args.push(s, s, s, s); }
   if (category_id) { where.push('p.category_id = ?'); args.push(category_id); }
   if (supplier_id) { where.push('p.supplier_id = ?'); args.push(supplier_id); }
   if (status) { where.push('p.status = ?'); args.push(status); }
@@ -874,18 +1140,19 @@ app.get('/api/products', authenticate, wrap(async (req, res) => {
 // These two must stay above /api/products/:id
 app.get('/api/products/low-stock', authenticate, wrap(async (req, res) => {
   const [rows] = await pool.query(
-    `${PRODUCT_SELECT} WHERE p.status = 'ACTIVE' AND p.current_stock > 0 AND p.current_stock <= p.min_stock_level ORDER BY p.current_stock`);
+    `${PRODUCT_SELECT} WHERE p.shop_id = ? AND p.status = 'ACTIVE' AND p.current_stock > 0
+      AND p.current_stock <= p.min_stock_level ORDER BY p.current_stock`, [req.user.shop_id]);
   res.json(rows);
 }));
 app.get('/api/products/expiring', authenticate, wrap(async (req, res) => {
   const [rows] = await pool.query(
-    `${PRODUCT_SELECT} WHERE p.status = 'ACTIVE' AND p.expiry_date IS NOT NULL
-    AND p.expiry_date <= ${NEXT_30_DAYS_SQL} ORDER BY p.expiry_date`);
+    `${PRODUCT_SELECT} WHERE p.shop_id = ? AND p.status = 'ACTIVE' AND p.expiry_date IS NOT NULL
+    AND p.expiry_date <= ${NEXT_30_DAYS_SQL} ORDER BY p.expiry_date`, [req.user.shop_id]);
   res.json(rows);
 }));
 
 app.get('/api/products/:id', authenticate, wrap(async (req, res) => {
-  const [rows] = await pool.query(`${PRODUCT_SELECT} WHERE p.id = ?`, [req.params.id]);
+  const [rows] = await pool.query(`${PRODUCT_SELECT} WHERE p.id = ? AND p.shop_id = ?`, [req.params.id, req.user.shop_id]);
   if (!rows[0]) return res.status(404).json({ message: 'Product not found.' });
   res.json(rows[0]);
 }));
@@ -893,52 +1160,76 @@ app.get('/api/products/:id', authenticate, wrap(async (req, res) => {
 app.post('/api/products', authenticate, authorize(...MANAGERS), uploadImage, productRules, validate, wrap(async (req, res) => {
   const b = req.body;
   const id = await withTransaction(async (conn) => {
+    const [[category]] = await conn.query(
+      'SELECT id FROM categories WHERE id = ? AND shop_id = ?',
+      [b.category_id, req.user.shop_id]
+    );
+    if (!category) throw httpError(400, 'Please select a category from this shop.');
+    if (b.supplier_id) {
+      const [[supplier]] = await conn.query(
+        'SELECT id FROM suppliers WHERE id = ? AND shop_id = ?',
+        [b.supplier_id, req.user.shop_id]
+      );
+      if (!supplier) throw httpError(400, 'Please select a supplier from this shop.');
+    }
     const [r] = await conn.query(
-      `INSERT INTO products (name, sku, barcode, category_id, supplier_id, brand, description, image_path,
+      `INSERT INTO products (shop_id, name, sku, barcode, category_id, supplier_id, brand, description, image_path,
         purchase_price, selling_price, tax_percentage, min_stock_level, reorder_quantity, expiry_date)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [b.name, b.sku, emptyToNull(b.barcode), b.category_id, emptyToNull(b.supplier_id), emptyToNull(b.brand),
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [req.user.shop_id, b.name, b.sku, emptyToNull(b.barcode), b.category_id, emptyToNull(b.supplier_id), emptyToNull(b.brand),
         emptyToNull(b.description), req.file ? `/uploads/${req.file.filename}` : null, b.purchase_price, b.selling_price,
         b.tax_percentage || 0, b.min_stock_level || 5, b.reorder_quantity || 10, emptyToNull(b.expiry_date)]
     );
     const qty = parseInt(b.current_stock) || 0;
-    if (qty > 0) await changeStock(conn, r.insertId, qty, 'PURCHASE', req.user.id, 'Opening stock');
+    if (qty > 0) await changeStock(conn, r.insertId, qty, 'PURCHASE', req.user.id, 'Opening stock', null, null, req.user.shop_id);
     return r.insertId;
   }).catch((err) => dbError(err, productDup));
-  await logAction(req.user.id, 'CREATE', 'product', id, { sku: b.sku }, req.ip);
-  await syncAlerts();
+  await logAction(req.user.id, 'CREATE', 'product', id, { sku: b.sku }, req.ip, req.user.shop_id);
+  await syncAlerts(req.user.shop_id);
   res.status(201).json({ message: 'Product added successfully.', id });
 }));
 
 app.put('/api/products/:id', authenticate, authorize(...MANAGERS), uploadImage, productRules, validate, wrap(async (req, res) => {
   const b = req.body;
-  const [[exists]] = await pool.query('SELECT id FROM products WHERE id = ?', [req.params.id]);
+  const [[exists]] = await pool.query('SELECT id FROM products WHERE id = ? AND shop_id = ?', [req.params.id, req.user.shop_id]);
   if (!exists) return res.status(404).json({ message: 'Product not found.' });
+  const [[category]] = await pool.query(
+    'SELECT id FROM categories WHERE id = ? AND shop_id = ?',
+    [b.category_id, req.user.shop_id]
+  );
+  if (!category) throw httpError(400, 'Please select a category from this shop.');
+  if (b.supplier_id) {
+    const [[supplier]] = await pool.query(
+      'SELECT id FROM suppliers WHERE id = ? AND shop_id = ?',
+      [b.supplier_id, req.user.shop_id]
+    );
+    if (!supplier) throw httpError(400, 'Please select a supplier from this shop.');
+  }
   try {
     await pool.query(
       `UPDATE products SET name=?, sku=?, barcode=?, category_id=?, supplier_id=?, brand=?, description=?,
         image_path=COALESCE(?, image_path), purchase_price=?, selling_price=?, tax_percentage=?,
-        min_stock_level=?, reorder_quantity=?, expiry_date=?, status=? WHERE id=?`,
+        min_stock_level=?, reorder_quantity=?, expiry_date=?, status=? WHERE id=? AND shop_id=?`,
       [b.name, b.sku, emptyToNull(b.barcode), b.category_id, emptyToNull(b.supplier_id), emptyToNull(b.brand),
         emptyToNull(b.description), req.file ? `/uploads/${req.file.filename}` : null, b.purchase_price, b.selling_price,
         b.tax_percentage || 0, b.min_stock_level || 5, b.reorder_quantity || 10, emptyToNull(b.expiry_date),
-        b.status === 'INACTIVE' ? 'INACTIVE' : 'ACTIVE', req.params.id]
+        b.status === 'INACTIVE' ? 'INACTIVE' : 'ACTIVE', req.params.id, req.user.shop_id]
     );
   } catch (err) { dbError(err, productDup); }
-  await logAction(req.user.id, 'UPDATE', 'product', Number(req.params.id), null, req.ip);
-  await syncAlerts();
+  await logAction(req.user.id, 'UPDATE', 'product', Number(req.params.id), null, req.ip, req.user.shop_id);
+  await syncAlerts(req.user.shop_id);
   res.json({ message: 'Product updated successfully.' });
 }));
 
 app.delete('/api/products/:id', authenticate, authorize(...MANAGERS), wrap(async (req, res) => {
   try {
-    const [r] = await pool.query('DELETE FROM products WHERE id = ?', [req.params.id]);
+    const [r] = await pool.query('DELETE FROM products WHERE id = ? AND shop_id = ?', [req.params.id, req.user.shop_id]);
     if (!r.affectedRows) return res.status(404).json({ message: 'Product not found.' });
-    await logAction(req.user.id, 'DELETE', 'product', Number(req.params.id), null, req.ip);
+    await logAction(req.user.id, 'DELETE', 'product', Number(req.params.id), null, req.ip, req.user.shop_id);
     res.json({ message: 'Product deleted.' });
   } catch (err) {
     if (err.code === 'ER_ROW_IS_REFERENCED_2') {
-      await pool.query("UPDATE products SET status = 'INACTIVE' WHERE id = ?", [req.params.id]);
+      await pool.query("UPDATE products SET status = 'INACTIVE' WHERE id = ? AND shop_id = ?", [req.params.id, req.user.shop_id]);
       return res.json({ message: 'This product has stock history, so it was set to Inactive instead of deleted.' });
     }
     throw err;
@@ -946,6 +1237,108 @@ app.delete('/api/products/:id', authenticate, authorize(...MANAGERS), wrap(async
 }));
 
 // ---------- Inventory ----------
+app.post('/api/inventory/voice/preview', authenticate, authorize('ADMIN', 'MANAGER', 'STAFF'),
+  voiceInventoryLimiter,
+  [
+    body('transcript').isString().trim().isLength({ min: 1, max: 5000 })
+      .withMessage('Enter or record a transcript with at most 5,000 characters.'),
+    body('language').isIn([...VOICE_LANGUAGES]).withMessage('Choose a supported language.'),
+  ],
+  validate,
+  wrap(async (req, res) => {
+    const extraction = await extractVoiceInventory(req.body.transcript, req.body.language);
+    const { items: extracted, source } = extraction;
+    const searchableNames = [...new Set(extracted.flatMap((item) => {
+      const names = [item.product_name, item.brand].filter(Boolean);
+      return names.flatMap((name) => {
+        const words = name.split(/\s+/).filter((word) => word.length >= 2).slice(0, 4);
+        return [name, ...words];
+      });
+    }))];
+    const candidates = searchableNames.length
+      ? await pool.query(
+        `SELECT p.id, p.name, p.brand, p.sku, p.current_stock, s.name AS supplier_name
+         FROM products p LEFT JOIN suppliers s ON s.id = p.supplier_id AND s.shop_id = p.shop_id
+         WHERE p.shop_id = ? AND p.status = 'ACTIVE'
+           AND (${searchableNames.map(() => '(p.name LIKE ? OR p.brand LIKE ?)').join(' OR ')})
+         ORDER BY p.name LIMIT 1000`,
+        [req.user.shop_id, ...searchableNames.flatMap((name) => [`%${name}%`, `%${name}%`])]
+      )
+      : [[]];
+    res.json({
+      items: matchCatalogItems(extracted, candidates[0]),
+      language: req.body.language,
+      source,
+    });
+  })
+);
+
+app.post('/api/inventory/voice/confirm', authenticate, authorize('ADMIN', 'MANAGER', 'STAFF'),
+  [
+    body('confirmed').custom((value) => value === true)
+      .withMessage('Confirm the reviewed inventory changes before saving.'),
+    body('items').isArray({ min: 1, max: 50 }).withMessage('Review between 1 and 50 products before confirming.'),
+    body('items.*.product_id').isInt({ min: 1 }).withMessage('Select a product from this shop for every entry.'),
+    body('items.*.quantity').isInt({ min: 1, max: 1000000 }).withMessage('Each received quantity must be between 1 and 1,000,000.'),
+    body('items.*.expiry_date').optional({ values: 'falsy' })
+      .custom((value) => isValidDate(value)).withMessage('Correct each invalid expiry date before confirming.'),
+  ],
+  validate,
+  wrap(async (req, res) => {
+    const items = validateConfirmationItems(req.body.items);
+
+    const results = await withTransaction(async (conn) => {
+      const saved = [];
+      for (const item of items) {
+        const [[product]] = await conn.query(
+          `SELECT id, status FROM products WHERE id = ? AND shop_id = ?${useMysql ? ' FOR UPDATE' : ''}`,
+          [item.productId, req.user.shop_id]
+        );
+        if (!product) throw httpError(400, 'A selected product does not belong to this shop.');
+        if (product.status !== 'ACTIVE') throw httpError(409, 'Activate an inactive product before receiving stock.');
+
+        const stock = await changeStock(
+          conn,
+          item.productId,
+          item.quantity,
+          'PURCHASE',
+          req.user.id,
+          'Received via voice inventory assistant',
+          'voice',
+          null,
+          req.user.shop_id
+        );
+        if (item.expiryDate) {
+          await conn.query(
+            `UPDATE products SET expiry_date = CASE
+               WHEN expiry_date IS NULL OR expiry_date > ? THEN ? ELSE expiry_date END
+             WHERE id = ? AND shop_id = ?`,
+            [item.expiryDate, item.expiryDate, item.productId, req.user.shop_id]
+          );
+        }
+        await conn.query(
+          `INSERT INTO audit_logs (shop_id, user_id, action, entity, entity_id, details, ip_address)
+           VALUES (?,?,?,?,?,?,?)`,
+          [
+            req.user.shop_id,
+            req.user.id,
+            'VOICE_STOCK_UPDATE',
+            'product',
+            item.productId,
+            JSON.stringify({ quantity: item.quantity, expiry_date: item.expiryDate }),
+            req.ip || null,
+          ]
+        );
+        saved.push({ product_id: item.productId, quantity: item.quantity, stock });
+      }
+      return saved;
+    });
+
+    await syncAlerts(req.user.shop_id);
+    res.json({ message: 'Confirmed stock updates saved.', items: results });
+  })
+);
+
 app.get('/api/inventory', authenticate, wrap(async (req, res) => {
   const [[s]] = await pool.query(
     `SELECT COUNT(*) AS total_products,
@@ -956,7 +1349,8 @@ app.get('/api/inventory', authenticate, wrap(async (req, res) => {
       COALESCE(SUM(current_stock = 0), 0) AS out_of_stock,
       COALESCE(SUM(expiry_date IS NOT NULL AND expiry_date >= ${TODAY_SQL} AND expiry_date <= ${NEXT_30_DAYS_SQL}), 0) AS expiring,
       COALESCE(SUM(expiry_date IS NOT NULL AND expiry_date < ${TODAY_SQL}), 0) AS expired
-     FROM products WHERE status = 'ACTIVE'`
+     FROM products WHERE shop_id = ? AND status = 'ACTIVE'`,
+    [req.user.shop_id]
   );
   res.json(s);
 }));
@@ -965,8 +1359,8 @@ app.get('/api/inventory/transactions', authenticate, wrap(async (req, res) => {
   const { product_id, type } = req.query;
   const page = Math.max(parseInt(req.query.page) || 1, 1);
   const limit = Math.min(Math.max(parseInt(req.query.limit) || 15, 1), 100);
-  const where = [];
-  const args = [];
+  const where = ['t.shop_id = ?'];
+  const args = [req.user.shop_id];
   if (product_id) { where.push('t.product_id = ?'); args.push(product_id); }
   if (type) { where.push('t.type = ?'); args.push(type); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
@@ -991,9 +1385,9 @@ app.post('/api/inventory/adjustment', authenticate, authorize('ADMIN', 'MANAGER'
     const qty = parseInt(req.body.quantity);
     const change = type === 'DAMAGE' || direction === 'remove' ? -qty : qty; // damaged stock always goes out
     const after = await withTransaction((conn) =>
-      changeStock(conn, product_id, change, type, req.user.id, note, 'adjustment'));
-    await logAction(req.user.id, 'ADJUST_STOCK', 'product', Number(product_id), { change, type }, req.ip);
-    await syncAlerts();
+      changeStock(conn, product_id, change, type, req.user.id, note, 'adjustment', null, req.user.shop_id));
+    await logAction(req.user.id, 'ADJUST_STOCK', 'product', Number(product_id), { change, type }, req.ip, req.user.shop_id);
+    await syncAlerts(req.user.shop_id);
     res.json({ message: `Stock updated. New stock: ${after}.`, stock: after });
   })
 );
@@ -1010,25 +1404,30 @@ app.post('/api/inventory/receive', authenticate, authorize('ADMIN', 'MANAGER', '
     const quantity = Number(req.body.quantity);
     const expiryDate = emptyToNull(req.body.expiry_date);
     const stock = await withTransaction(async (conn) => {
-      const [[product]] = await conn.query('SELECT id, status FROM products WHERE barcode = ?', [barcode]);
+      const [[product]] = await conn.query(
+        'SELECT id, status FROM products WHERE shop_id = ? AND barcode = ?',
+        [req.user.shop_id, barcode]
+      );
       if (!product) throw httpError(404, 'Product not found. Scan it again to add it as a new product.');
       if (product.status !== 'ACTIVE') throw httpError(409, 'This product is inactive. Activate it before receiving stock.');
 
-      const after = await changeStock(conn, product.id, quantity, 'PURCHASE', req.user.id, 'Received by barcode scan');
+      const after = await changeStock(
+        conn, product.id, quantity, 'PURCHASE', req.user.id, 'Received by barcode scan', null, null, req.user.shop_id
+      );
       if (expiryDate) {
         await conn.query(
           `UPDATE products SET expiry_date = CASE
              WHEN expiry_date IS NULL OR expiry_date > ? THEN ? ELSE expiry_date END
-           WHERE id = ?`,
-          [expiryDate, expiryDate, product.id]
+           WHERE id = ? AND shop_id = ?`,
+          [expiryDate, expiryDate, product.id, req.user.shop_id]
         );
       }
       return { productId: product.id, after };
     });
 
     await logAction(req.user.id, 'RECEIVE_STOCK', 'product', stock.productId,
-      { barcode, quantity, expiry_date: expiryDate }, req.ip);
-    await syncAlerts();
+      { barcode, quantity, expiry_date: expiryDate }, req.ip, req.user.shop_id);
+    await syncAlerts(req.user.shop_id);
     res.json({ message: `Received ${quantity} unit(s). New stock: ${stock.after}.`, stock: stock.after });
   })
 );
@@ -1045,40 +1444,61 @@ app.post('/api/inventory/receive-new', authenticate, authorize(...MANAGERS),
     const barcode = b.barcode.trim();
     const quantity = Number(b.quantity);
     const productId = await withTransaction(async (conn) => {
-      const [[existing]] = await conn.query('SELECT id FROM products WHERE barcode = ?', [barcode]);
+      const [[existing]] = await conn.query(
+        'SELECT id FROM products WHERE shop_id = ? AND barcode = ?',
+        [req.user.shop_id, barcode]
+      );
       if (existing) throw httpError(409, 'A product with this barcode already exists. Scan it again to receive stock.');
+      const [[category]] = await conn.query(
+        'SELECT id FROM categories WHERE id = ? AND shop_id = ?',
+        [b.category_id, req.user.shop_id]
+      );
+      if (!category) throw httpError(400, 'Please select a category from this shop.');
+      if (b.supplier_id) {
+        const [[supplier]] = await conn.query(
+          'SELECT id FROM suppliers WHERE id = ? AND shop_id = ?',
+          [b.supplier_id, req.user.shop_id]
+        );
+        if (!supplier) throw httpError(400, 'Please select a supplier from this shop.');
+      }
 
       const [result] = await conn.query(
-        `INSERT INTO products (name, sku, barcode, category_id, supplier_id, brand, description,
+        `INSERT INTO products (shop_id, name, sku, barcode, category_id, supplier_id, brand, description,
           purchase_price, selling_price, tax_percentage, current_stock, min_stock_level, reorder_quantity, expiry_date)
-         VALUES (?,?,?,?,?,?,?,?,?, ?,0,?,?,?)`,
-        [b.name, b.sku, barcode, b.category_id, emptyToNull(b.supplier_id), emptyToNull(b.brand),
+         VALUES (?,?,?,?,?,?,?,?,?,?, ?,0,?,?,?)`,
+        [req.user.shop_id, b.name, b.sku, barcode, b.category_id, emptyToNull(b.supplier_id), emptyToNull(b.brand),
           emptyToNull(b.description), b.purchase_price, b.selling_price, b.tax_percentage || 0,
           b.min_stock_level || 5, b.reorder_quantity || 10, emptyToNull(b.expiry_date)]
       );
-      await changeStock(conn, result.insertId, quantity, 'PURCHASE', req.user.id, 'Received by barcode scan');
+      await changeStock(
+        conn, result.insertId, quantity, 'PURCHASE', req.user.id, 'Received by barcode scan', null, null, req.user.shop_id
+      );
       return result.insertId;
     }).catch((err) => dbError(err, productDup));
 
-    await logAction(req.user.id, 'CREATE', 'product', productId, { sku: b.sku, barcode }, req.ip);
-    await logAction(req.user.id, 'RECEIVE_STOCK', 'product', productId, { barcode, quantity }, req.ip);
-    await syncAlerts();
+    await logAction(req.user.id, 'CREATE', 'product', productId, { sku: b.sku, barcode }, req.ip, req.user.shop_id);
+    await logAction(req.user.id, 'RECEIVE_STOCK', 'product', productId, { barcode, quantity }, req.ip, req.user.shop_id);
+    await syncAlerts(req.user.shop_id);
     res.status(201).json({ message: `Product created and ${quantity} unit(s) received.`, id: productId, stock: quantity });
   })
 );
 
 // ---------- Notifications ----------
 app.get('/api/notifications', authenticate, wrap(async (req, res) => {
-  const [items] = await pool.query('SELECT * FROM notifications ORDER BY is_read, id DESC LIMIT 50');
-  const [[{ unread }]] = await pool.query('SELECT COUNT(*) AS unread FROM notifications WHERE is_read = FALSE');
+  const [items] = await pool.query(
+    'SELECT * FROM notifications WHERE shop_id = ? ORDER BY is_read, id DESC LIMIT 50', [req.user.shop_id]
+  );
+  const [[{ unread }]] = await pool.query(
+    'SELECT COUNT(*) AS unread FROM notifications WHERE shop_id = ? AND is_read = FALSE', [req.user.shop_id]
+  );
   res.json({ items, unread });
 }));
 app.put('/api/notifications/read-all', authenticate, wrap(async (req, res) => {
-  await pool.query('UPDATE notifications SET is_read = TRUE');
+  await pool.query('UPDATE notifications SET is_read = TRUE WHERE shop_id = ?', [req.user.shop_id]);
   res.json({ message: 'All notifications marked as read.' });
 }));
 app.put('/api/notifications/:id/read', authenticate, wrap(async (req, res) => {
-  await pool.query('UPDATE notifications SET is_read = TRUE WHERE id = ?', [req.params.id]);
+  await pool.query('UPDATE notifications SET is_read = TRUE WHERE id = ? AND shop_id = ?', [req.params.id, req.user.shop_id]);
   res.json({ message: 'Marked as read.' });
 }));
 // ================= END PHASE 3 =================
@@ -1089,10 +1509,11 @@ app.get('/api/dashboard', authenticate, authorize(...MANAGERS), wrap(async (req,
     `SELECT COUNT(*) AS total_products,
       COALESCE(SUM(current_stock), 0) AS total_units,
       COALESCE(SUM(current_stock = 0), 0) AS out_of_stock
-     FROM products WHERE status = 'ACTIVE'`
+     FROM products WHERE shop_id = ? AND status = 'ACTIVE'`,
+     [req.user.shop_id]
   );
 
-  // Sample seed invoices are excluded so charts only reflect recorded business sales.
+  // Legacy test invoices are excluded; chart examples use distinct CHART invoice numbers.
   const [salesRows] = await pool.query(
     `SELECT ${MONTH_FORMAT_SQL('s.created_at')} AS ym,
        SUM(s.final_amount) AS sales,
@@ -1105,9 +1526,10 @@ app.get('/api/dashboard', authenticate, authorize(...MANAGERS), wrap(async (req,
           FROM sale_items si WHERE si.sale_id = s.id) / s.subtotal
          ELSE 0 END) END AS gross_profit
      FROM sales s
-     WHERE s.status <> 'RETURNED' AND s.invoice_number NOT LIKE 'INV-DEMO-%'
+     WHERE s.shop_id = ? AND s.status <> 'RETURNED' AND s.invoice_number NOT LIKE 'INV-DEMO-%'
        AND s.created_at >= ${SIX_MONTHS_AGO_SQL}
-     GROUP BY ym`
+     GROUP BY ym`,
+    [req.user.shop_id]
   );
   const salesBy = Object.fromEntries(salesRows.map((r) => [r.ym, {
     sales: Number(r.sales),
@@ -1128,17 +1550,19 @@ app.get('/api/dashboard', authenticate, authorize(...MANAGERS), wrap(async (req,
 
   const [lowStock] = await pool.query(
     `SELECT id, sku, name, min_stock_level, current_stock FROM products
-     WHERE status = 'ACTIVE' AND current_stock <= min_stock_level
-     ORDER BY current_stock ASC, id ASC LIMIT 5`
+     WHERE shop_id = ? AND status = 'ACTIVE' AND current_stock <= min_stock_level
+     ORDER BY current_stock ASC, id ASC LIMIT 5`,
+    [req.user.shop_id]
   );
 
   const [topSelling] = await pool.query(
     `SELECT p.id, p.name, p.selling_price, p.current_stock AS remaining_qty,
        SUM(si.quantity - si.returned_quantity) AS sold_qty
      FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN products p ON p.id = si.product_id
-     WHERE s.status <> 'RETURNED' AND s.invoice_number NOT LIKE 'INV-DEMO-%'
+     WHERE s.shop_id = ? AND p.shop_id = ? AND s.status <> 'RETURNED' AND s.invoice_number NOT LIKE 'INV-DEMO-%'
      GROUP BY p.id, p.name, p.selling_price, p.current_stock HAVING sold_qty > 0
-     ORDER BY sold_qty DESC, p.name ASC LIMIT 5`
+     ORDER BY sold_qty DESC, p.name ASC LIMIT 5`,
+    [req.user.shop_id, req.user.shop_id]
   );
 
   res.json({
@@ -1490,10 +1914,12 @@ async function start() {
     return;
   }
   await initializeDatabase();
+  await ensureTenantSchema(pool.query, useMysql);
   const PORT = process.env.PORT || 5000;
   app.listen(PORT, () => {
     console.log(`SmartBiz API running on port ${PORT} using ${useMysql ? 'MySQL' : 'SQLite'}`);
     setTimeout(() => syncAlerts().catch((err) => console.error('Alert sync failed:', err.message)), 1000);
+    setInterval(() => syncAlerts().catch((err) => console.error('Scheduled alert sync failed:', err.message)), 24 * 60 * 60 * 1000);
   });
 }
 

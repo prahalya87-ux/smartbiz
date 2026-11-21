@@ -22,6 +22,10 @@ describe('local SmartBiz assistant', () => {
     assert.match(await ask('Does this chatbot use an API key?'), /does not call an external AI provider/i);
     assert.match(await ask('How does SmartBiz detect low stock?'), /compares each active product/i);
     assert.match(await ask('How does SmartBiz track expiry dates?'), /stores product expiry dates/i);
+    assert.match(await ask('How does voice stock work?'), /correct anything uncertain, then confirm to save/i);
+    assert.match(await ask('What can you do?'), /Show gross profit this month/i);
+    assert.match(await ask('Explain the dashboard.'), /Figures come from sales recorded for your shop/i);
+    assert.match(await ask('What is the weather?'), /Which products are expiring/i);
   });
 
   it('answers low-stock and stock questions from actual records', async () => {
@@ -129,6 +133,7 @@ describe('local SmartBiz assistant', () => {
     assert.equal(classifyQuestion('Which products are out of stock?').outOfStockOnly, true);
     const questionVariants = [
       ['How much did I sell today?', 'sales', 'today'],
+      ['How much did we make this month?', 'sales', 'this_month'],
       ['What were my sales yesterday?', 'sales', 'yesterday'],
       ['What are my sales this month?', 'sales', 'this_month'],
       ['Show sales for the last 7 days.', 'sales', 'last_7_days'],
@@ -139,6 +144,9 @@ describe('local SmartBiz assistant', () => {
       ['Which products sell the least?', 'top_products', 'all_time'],
       ['Which products generated the most revenue?', 'top_products_revenue', 'all_time'],
       ['What should I restock?', 'inventory', null],
+      ['What stock do I have on hand?', 'inventory', null],
+      ['Which products are about to expire?', 'inventory', null],
+      ['Which products have a best before date coming soon?', 'inventory', null],
       ['Which items need replenishment?', 'inventory', null],
       ['How much stock do I have?', 'inventory', null],
       ['Show my purchase history.', 'purchases', 'this_month'],

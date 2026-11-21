@@ -121,22 +121,24 @@ describe('SmartBiz AI business data against the current database', () => {
     assert.equal(comparison.change_amount, currentExpected.amount - previousExpected.amount);
 
     const soldProduct = db.prepare(
-      `SELECT p.name FROM products p JOIN sale_items si ON si.product_id = p.id
+      `SELECT p.name, p.sku FROM products p JOIN sale_items si ON si.product_id = p.id
        JOIN sales s ON s.id = si.sale_id WHERE s.status <> 'RETURNED'
-       GROUP BY p.id ORDER BY p.name LIMIT 1`
+         AND (SELECT COUNT(*) FROM products match_product
+              WHERE match_product.name = p.name AND match_product.sku = p.sku) = 1
+       GROUP BY p.id, p.name, p.sku ORDER BY p.name LIMIT 1`
     ).get();
     if (soldProduct) {
       const productResult = await businessData.execute('get_product_sales_summary', {
-        search: soldProduct.name,
+        search: soldProduct.sku,
         period: 'all_time',
       }, 'CASHIER');
-      const matching = productResult.products.find((product) => product.name === soldProduct.name);
+      const matching = productResult.products.find((product) => product.name === soldProduct.name && product.sku === soldProduct.sku);
       assert.ok(matching);
       const expectedUnits = db.prepare(
         `SELECT SUM(si.quantity - si.returned_quantity) AS units
          FROM sale_items si JOIN sales s ON s.id = si.sale_id JOIN products p ON p.id = si.product_id
-         WHERE p.name = ? AND s.status <> 'RETURNED'`
-      ).get(soldProduct.name).units;
+         WHERE p.name = ? AND p.sku = ? AND s.status <> 'RETURNED'`
+      ).get(soldProduct.name, soldProduct.sku).units;
       assert.equal(matching.units_sold, expectedUnits);
     }
     await assert.rejects(
@@ -145,14 +147,20 @@ describe('SmartBiz AI business data against the current database', () => {
     );
   });
 
-  it('ranks actual product revenue and returns real empty customer balance records', async () => {
+  it('ranks actual product revenue and returns only customers with open balances', async () => {
     const top = await businessData.execute('get_top_products_by_revenue', { period: 'all_time' }, 'MANAGER');
     if (count('sale_items') === 0) assert.deepEqual(top.products, []);
     else assert.ok(top.products.length > 0);
     assert.ok(top.products.every((product) => product.net_revenue_excluding_tax > 0 && product.units_sold > 0));
     const customers = await businessData.execute('get_customer_balances', { search: '' }, 'CASHIER');
-    assert.equal(customers.customers.length, count('customers'));
-    assert.equal(customers.customers.length, 0);
+    const expectedCustomers = db.prepare(
+      `SELECT COUNT(*) AS count FROM customers c WHERE EXISTS (
+         SELECT 1 FROM sales s WHERE s.customer_id = c.id AND s.status <> 'RETURNED'
+           AND s.final_amount - s.amount_paid -
+             COALESCE((SELECT SUM(r.refund_amount) FROM returns r WHERE r.sale_id = s.id), 0) > 0
+       )`
+    ).get();
+    assert.equal(customers.customers.length, Math.min(expectedCustomers.count, 20));
     const unlinked = db.prepare(
       `SELECT COUNT(*) AS count FROM sales s WHERE s.customer_id IS NULL
        AND s.status <> 'RETURNED' AND s.final_amount > s.amount_paid`

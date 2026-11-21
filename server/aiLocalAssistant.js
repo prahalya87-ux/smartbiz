@@ -1,7 +1,7 @@
-const UNKNOWN_ANSWER = "I couldn't identify that business question. Try asking about sales, inventory, purchases, profit, payments, returns, or SmartBiz features.";
+const UNKNOWN_ANSWER = "I couldn't match that question to a supported SmartBiz query. Try a specific question such as “Show sales for the last 30 days”, “Which products are expiring?”, or “Show gross profit this month”.";
 
 const INTENT_REGISTRY = {
-  help: /\b(help|what can i ask|suggestions|examples)\b/,
+  help: /\b(help|what can i ask|what can you do|how can you help|suggestions|examples|capabilities)\b/,
   dashboardReport: /\b(dashboard report|dashboard summary|business report|report summary|show dashboard)\b/,
   comparison: /\b(compare|comparison|versus|vs)\b/,
   forecast: /\b(predict|forecast|future|next 7 days|next 30 days|next month)\b/,
@@ -13,9 +13,9 @@ const INTENT_REGISTRY = {
   customers: /\b(customer|customers|client|clients)\b/,
   productRevenue: /\b(products?|items?)\b.*\brevenue\b|\brevenue\b.*\b(products?|items?)\b/,
   topProducts: /\b(best selling|top selling|sell the most|selling the most|most sold|most units sold|top products|slow moving|not selling|sell the least|sold the least|selling least|highest number of units|rank all products)\b/,
-  inventory: /\b(low stock|running low|out of stock|no stock|reorder|restock|replenish|reorder point|reorder level|below minimum|below their reorder|need replenishment|available stock|stock status|how much stock|stock quantity|units available|current stock|inventory|excess stock|negative stock|high stock)\b/,
-  expiry: /\bexpir\w*\b/,
-  sales: /\b(sales|revenue|gross profit|net profit|profit|turnover|how much (did|have) (i|we) sell|how much (have) (i|we) sold|average order value|average sale|completed sales|sales history|sales performance|sales increasing|sales decreasing|sales rising|sales falling|sales going up|sales going down|sales trend)\b/,
+  inventory: /\b(low stock|running low|out of stock|no stock|reorder|restock|replenish|reorder point|reorder level|below minimum|below their reorder|need replenishment|available stock|stock status|how much stock|stock quantity|units available|current stock|stock left|on hand|inventory|excess stock|negative stock|high stock)\b/,
+  expiry: /\bexpir\w*\b|\b(best before|near expiration|close to expiration|about to expire)\b/,
+  sales: /\b(sales|revenue|gross profit|net profit|profit|turnover|earnings|how much (did|have) (i|we) sell|how much (have) (i|we) sold|how much (did|do) (i|we) make|how much (did|have) (i|we) made|average order value|average sale|completed sales|sales history|sales performance|sales increasing|sales decreasing|sales rising|sales falling|sales going up|sales going down|sales trend)\b/,
   followUp: /^(and |what about |how about |same for |only |show only |top |compare (with|against|to) )/,
 };
 
@@ -53,6 +53,10 @@ const WEBSITE_KNOWLEDGE = [
     answer: 'This SmartBiz Assistant runs locally in the Express backend using JavaScript rules and approved database queries. It does not call an external AI provider or require an AI API key. It can answer supported questions, but it is not a trained language model and may ask you to rephrase unsupported questions.',
   },
   {
+    match: /\b(voice stock|voice assistant|voice inventory|speak to (the )?(assistant|smartbiz)|talk to (the )?(assistant|smartbiz))\b/i,
+    answer: 'On the Inventory page, choose Voice stock to dictate a stock update. SmartBiz shows the recognized text and extracted fields for review; correct anything uncertain, then confirm to save. Cancel leaves inventory unchanged. Browser speech recognition and speech playback depend on your browser and microphone permissions.',
+  },
+  {
     match: /\b(how do i use|how to use|getting started|navigate|navigation|where can i find)\b/i,
     answer: 'Use the SmartBiz sidebar to open Dashboard, Products, Categories, Suppliers, Inventory, and Notifications. Dashboard, Categories, and Suppliers are limited to Admin and Manager roles; available actions on other pages also depend on your role.',
   },
@@ -62,7 +66,7 @@ const WEBSITE_KNOWLEDGE = [
   },
   {
     match: /\b(what is on|what does .* show|who can see|explain) (the )?(smartbiz )?(dashboard|reports?)\b/i,
-    answer: 'The Dashboard is available to Admins and Managers and shows inventory totals, stock alerts, recorded sales and gross profit, and top-selling products. Charts remain empty until real sales are recorded.',
+    answer: 'The Dashboard is available to Admins and Managers and shows inventory totals, stock alerts, recorded sales and gross profit, and top-selling products. Figures come from sales recorded for your shop; gross profit is product margin, not net profit.',
   },
 ];
 
@@ -412,8 +416,8 @@ async function answerLocalQuestion({ messages, role, businessData }) {
     if (entry.match.test(normalized)) return entry.answer;
   }
 
-  if (/\b(help|what can i ask|suggestions|examples)\b/.test(normalized)) {
-    return 'You can ask about current, low, or out-of-stock products; expiry dates; sales totals, average order value, and supported period comparisons; product unit or revenue rankings; purchases, customer balances, payments, returns, or SmartBiz features. Available questions depend on your account role.';
+  if (INTENT_REGISTRY.help.test(normalized)) {
+    return 'I can look up current, low, or out-of-stock products; products expiring soon or already expired; sales and gross profit for supported periods; product rankings; purchases; balances; payments; returns; and SmartBiz features. Try “What is my stock left?”, “Show gross profit this month”, “Which products are about to expire?”, or “Compare this month with last month”. Available answers depend on your account role.';
   }
 
   const intent = classifyQuestion(rawQuestion, messages);

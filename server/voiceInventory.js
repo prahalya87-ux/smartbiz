@@ -56,7 +56,7 @@ function normalizeExtraction(extraction) {
 
 const RECEIPT_INTENT = /(?:\b(?:received?|receive|got|add(?:ed)?|restock(?:ed)?|stock(?:ed)?)\b|प्राप्त|मिला|मिले|जोड़|स्टॉक|பெற்ற|பெறு|சேர்த்த|சேர்க்க|స్వీకర|పొంద|చేర్చ|జోడించ|ಸ್ವೀಕರ|ಪಡೆದ|ಸೇರಿಸ|ಜೋಡಿಸ|ലഭിച്ച|സ്വീകര|ചേർത്ത|ചേർക്ക)/iu;
 const EXPIRY_MARKER = /(?:\b(?:expiry|expires?|expiration|exp|best before)\b|समाप्ति|एक्सपायरी|காலாவதி|గడువు|ಮುಕ್ತಾಯ|കാലാവധി)/iu;
-const QUANTITY_PATTERN = /(\d{1,7})\s+(?:(?:packets?|packs?|pieces?|units?|bottles?|bags?|boxes|box|cartons?|cases?|pcs|nos|items?|पैकेट|पैकेटों|पीस|यूनिट|बोतल|डिब्बे|பாக்கெட்|பாக்கெட்டுகள்|துண்டுகள்|யூனிட்கள்|பாட்டில்கள்|பெட்டிகள்|ప్యాకెట్లు|యూనిట్లు|సీసాలు|డబ్బాలు|ಪ್ಯಾಕೆಟ್|ಘಟಕಗಳು|ಬಾಟಲಿಗಳು|ಪೆಟ್ಟಿಗೆಗಳು|പാക്കറ്റുകൾ|പാക്കറ്റ്|യൂണിറ്റുകൾ|കുപ്പികൾ|പെട്ടികൾ)(?:\s+(?:of|की|का|के|ఇవీ|యొక్క|இன்|ನ|ന്റെ))?\s+|(?:of|की|का|के|యొక్క|இன்|ನ|ന്റെ)\s+)/giu;
+const QUANTITY_PATTERN = /(\d{1,7})\s*(?:(?:packets?|packs?|pieces?|units?|bottles?|bags?|boxes|box|cartons?|cases?|pcs|nos|items?|kilograms?|kilogram|kgs?|kg|grams?|gram|g|millilit(?:er|re)s?|lit(?:er|re)s?|ml|l|dozens?|cans?|jars?|tins?|tubes?|strips?|tablets?|capsules?|sachets?|bundles?|rolls?|पैकेट|पैकेटों|पीस|यूनिट|बोतल|डिब्बे|किलो|किलोग्राम|ग्राम|लीटर|மில்லி|கிலோ|கிராம்|லிட்டர்|பாக்கெட்|பாக்கெட்டுகள்|துண்டுகள்|யூனிட்கள்|பாட்டில்கள்|பெட்டிகள்|ప్యాకెట్లు|యూనిట్లు|సీసాలు|డబ్బాలు|కిలో|కిలోలు|గ్రాములు|లీటర్లు|ప్యాకెట్లు|ಘಟಕಗಳು|ಬಾಟಲಿಗಳು|ಪೆಟ್ಟಿಗೆಗಳು|ಕಿಲೋ|ಗ್ರಾಂ|ಲೀಟರ್|പാക്കറ്റുകൾ|പാക്കറ്റ്|യൂണിറ്റുകൾ|കുപ്പികൾ|പെട്ടികൾ|കിലോ|ഗ്രാം|ലിറ്റർ)(?:\s+(?:of|की|का|के|ఇవీ|యొక్క|இன்|ನ|ന്റെ))?\s+|(?:of|की|का|के|యొక్క|இன்|ನ|ന്റെ)\s+)/giu;
 
 const MONTHS = {
   january: 1, jan: 1, february: 2, feb: 2, march: 3, mar: 3, april: 4, apr: 4,
@@ -129,6 +129,27 @@ function extractOfflineInventory(transcript) {
 
   const matches = [...text.matchAll(QUANTITY_PATTERN)];
   if (!matches.length) {
+    const expiryMarker = EXPIRY_MARKER.exec(text);
+    const inventoryText = expiryMarker ? text.slice(0, expiryMarker.index) : text;
+    const expiry = parseOfflineExpiry(text);
+    const unqualifiedMatches = [...inventoryText.matchAll(
+      /(\d{1,7})\s+([\p{L}\p{M}][^,;.!?]*?)(?=\s+(?:and|&)\s+\d{1,7}\s+[\p{L}\p{M}]|[,;.!?]|$)/giu
+    )];
+    if (unqualifiedMatches.length) {
+      return {
+        items: unqualifiedMatches.slice(0, 50).map((match) => ({
+          product_name: match[2].trim().replace(/\s*(?:,|;|\band\b)\s*$/iu, ''),
+          brand: null,
+          quantity: Number(match[1]) <= 1000000 ? Number(match[1]) : null,
+          expiry_date: expiry.expiry_date,
+          expiry_text: expiry.expiry_text,
+          warnings: [
+            'No stock unit was stated. Confirm that this count matches your inventory unit.',
+            ...(expiry.expiry_text && !expiry.expiry_date ? ['Please confirm the expiry date.'] : []),
+          ],
+        })),
+      };
+    }
     return {
       items: [{
         product_name: '',

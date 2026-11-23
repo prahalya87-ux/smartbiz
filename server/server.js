@@ -18,6 +18,7 @@ const { answerLocalQuestion } = require('./aiLocalAssistant');
 const { isSupportedBarcode, lookupBarcode } = require('./barcodeCatalog');
 const { getMysqlSslOptions } = require('./mysqlSsl');
 const { ensureTenantSchema } = require('./tenantSchema');
+const { addDefaultCategories } = require('./shopCategories');
 const {
   LANGUAGE_CODES: VOICE_LANGUAGES,
   extractVoiceInventory,
@@ -610,6 +611,7 @@ app.post(
         [shopId, shopCode, shopName, shopType, address, country, state, city, area, pincode,
           latitude === undefined ? null : Number(latitude), longitude === undefined ? null : Number(longitude), result.insertId]
       );
+      await addDefaultCategories(conn.query, shopId, shopType);
       await conn.query(
         'INSERT INTO shop_members (user_id, shop_id, role, status) VALUES (?,?,?,?)',
         [result.insertId, shopId, 'ADMIN', 'ACTIVE']
@@ -1920,6 +1922,8 @@ async function start() {
   }
   await initializeDatabase();
   await ensureTenantSchema(pool.query, useMysql);
+  const [shops] = await pool.query('SELECT id, shop_type FROM shops');
+  for (const shop of shops) await addDefaultCategories(pool.query, shop.id, shop.shop_type);
   const PORT = process.env.PORT || 5000;
   app.listen(PORT, () => {
     console.log(`SmartBiz API running on port ${PORT} using ${useMysql ? 'MySQL' : 'SQLite'}`);

@@ -1945,7 +1945,6 @@ function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
   categoriesRef.current = categories.data;
   const barcodeRef = useRef(null);
   const videoRef = useRef(null);
-  const cameraStreamRef = useRef(null);
   const cameraControlsRef = useRef(null);
   const cameraScanHandledRef = useRef(false);
   const [barcode, setBarcode] = useState('');
@@ -2024,7 +2023,6 @@ function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
     const startCameraReader = async () => {
       let timeoutId;
       let requestTimedOut = false;
-      let stream;
       try {
         const [{ BrowserMultiFormatReader, BarcodeFormat }, { DecodeHintType }] = await Promise.all([
           import('@zxing/browser'),
@@ -2056,21 +2054,34 @@ function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
           delayBetweenScanSuccess: 250,
           delayBetweenScanAttempts: 100,
         });
-        const cameraRequest = navigator.mediaDevices.getUserMedia({
-          audio: false,
-          video: {
-            facingMode: { ideal: 'environment' },
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-          },
-        }).then((mediaStream) => {
-          if (cancelled || requestTimedOut) {
-            mediaStream.getTracks().forEach((track) => track.stop());
+        const video = videoRef.current;
+        if (!video) throw new Error('CAMERA_PREVIEW_UNAVAILABLE');
+        const cameraRequest = reader.decodeFromVideoDevice(
+          undefined,
+          video,
+          (result, _error, scanControls) => {
+            if (!result) return;
+            if (cancelled || requestTimedOut || cameraScanHandledRef.current) {
+              scanControls.stop();
+              return;
+            }
+            cameraScanHandledRef.current = true;
+            scanControls.stop();
+            if (cameraControlsRef.current === scanControls) cameraControlsRef.current = null;
+            setCameraActive(false);
+            setCameraLoading(false);
+            const code = result.getText();
+            setBarcode(code);
+            lookupBarcode(code);
+          }
+        ).then((controls) => {
+          if (cancelled || requestTimedOut || cameraScanHandledRef.current) {
+            controls.stop();
             return null;
           }
-          return mediaStream;
+          return controls;
         });
-        stream = await Promise.race([
+        const controls = await Promise.race([
           cameraRequest,
           new Promise((_, reject) => {
             timeoutId = setTimeout(() => {
@@ -2079,40 +2090,12 @@ function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
             }, 15000);
           }),
         ]);
-        if (!stream || cancelled) return;
-        cameraStreamRef.current = stream;
-        const video = videoRef.current;
-        if (!video) throw new Error('CAMERA_PREVIEW_UNAVAILABLE');
-        video.srcObject = stream;
-        await video.play();
-        if (cancelled) return;
-        const videoTrack = stream.getVideoTracks()[0];
-        if (!videoTrack || videoTrack.readyState !== 'live') throw new Error('CAMERA_TRACK_UNAVAILABLE');
-        const controls = await reader.decodeFromVideoElement(
-          video,
-          (result, _error, scanControls) => {
-            if (!result || cameraScanHandledRef.current) return;
-            cameraScanHandledRef.current = true;
-            scanControls.stop();
-            if (cameraControlsRef.current === scanControls) cameraControlsRef.current = null;
-            stream.getTracks().forEach((track) => track.stop());
-            if (cameraStreamRef.current === stream) cameraStreamRef.current = null;
-            if (video.srcObject === stream) video.srcObject = null;
-            setCameraActive(false);
-            const code = result.getText();
-            setBarcode(code);
-            lookupBarcode(code);
-          }
-        );
-        if (cancelled || stream.getTracks().every((track) => track.readyState !== 'live')) {
-          controls.stop();
-          return;
-        }
+        if (!controls || cancelled) return;
         cameraControlsRef.current = controls;
         setCameraLoading(false);
       } catch (error) {
-        if (stream) stream.getTracks().forEach((track) => track.stop());
-        if (cameraStreamRef.current === stream) cameraStreamRef.current = null;
+        cameraControlsRef.current?.stop();
+        cameraControlsRef.current = null;
         if (cancelled) return;
         setCameraActive(false);
         if (error.message === 'CAMERA_PERMISSION_TIMEOUT') {
@@ -2137,9 +2120,6 @@ function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
       cancelled = true;
       cameraControlsRef.current?.stop();
       cameraControlsRef.current = null;
-      cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
-      cameraStreamRef.current = null;
-      if (videoRef.current) videoRef.current.srcObject = null;
       cameraScanHandledRef.current = false;
     };
   }, [cameraActive, lookupBarcode]);
@@ -2147,9 +2127,6 @@ function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
   const stopCamera = () => {
     cameraControlsRef.current?.stop();
     cameraControlsRef.current = null;
-    cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
-    cameraStreamRef.current = null;
-    if (videoRef.current) videoRef.current.srcObject = null;
     setCameraActive(false);
   };
 
@@ -2258,6 +2235,7 @@ function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
             className="w-100 rounded bg-dark"
             style={{ maxHeight: 320, minHeight: 180, objectFit: 'contain' }}
             muted
+            autoPlay
             playsInline
             aria-label="Live camera barcode preview"
           />
@@ -2615,7 +2593,7 @@ function VoiceInventoryAssistant({ onClose, onManual, onSaved }) {
         <label htmlFor="voice-transcript" className="form-label">Recognized speech preview — edit before extraction</label>
         <textarea id="voice-transcript" className="form-control mb-2" rows="3" maxLength="5000"
           value={transcript} onChange={(event) => setTranscript(event.target.value)}
-          placeholder="For example: Received 20 packets of Britannia biscuits, expiry December 2027." />
+          placeholder="For example: Received 20 packets of biscuits, 2 kg rice, and 10 strips of paracetamol." />
         <div className="d-flex flex-wrap gap-2">
           <button type="button" className={`btn ${recording ? 'btn-danger' : 'btn-outline-primary'}`}
             onClick={recording ? () => recognitionRef.current?.stop() : startRecording} disabled={extracting || saving}>

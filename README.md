@@ -19,6 +19,8 @@ brand, and category suggestions (source:
 and enter prices, received quantity, and package expiry yourself. Expiry
 tracking stores the earliest date per product rather than tracking individual
 batches.
+New shops receive starter categories for their selected shop type; Admins and
+Managers can edit these from Categories.
 Expiry alerts are refreshed at startup, after relevant inventory changes, and
 daily while the API is running.
 
@@ -61,9 +63,11 @@ OpenAI-compatible extraction service on the API with `VOICE_AI_API_KEY`,
 `VOICE_AI_API_URL` (defaults to the OpenAI chat-completions endpoint), and
 `VOICE_AI_MODEL` (defaults to `gpt-4o-mini`). Keep the key only in the server
 environment; it is never sent to the browser. Without a configured key, a
-limited offline parser handles simple receipt phrases, supported quantity
-units, and English month/year expiry dates; other phrasing stays editable for
-correction or manual entry.
+limited offline parser handles simple receipt phrases, common count and package
+units, weight/volume units, medicine units, and English month/year expiry dates.
+If a count has no stated unit, it asks the user to confirm the count before
+saving; other unsupported phrasing stays editable for correction or manual
+entry.
 
 Voice extraction only creates a review preview. It does not write inventory.
 Missing or uncertain values, catalog matches, and possible duplicates are

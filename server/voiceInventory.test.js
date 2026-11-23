@@ -83,6 +83,38 @@ describe('voice inventory extraction', () => {
     assert.deepEqual(multiple.items.map((item) => item.product_name), ['biscuits', 'juice']);
   });
 
+  it('extracts quantities stated with weight, medicine, and package units', async () => {
+    const result = await extractVoiceInventory(
+      'Received 2 kg rice and 10 strips of paracetamol tablets',
+      'en-US',
+      { apiKey: '' }
+    );
+    assert.deepEqual(result.items.map((item) => item.quantity), [2, 10]);
+    assert.deepEqual(result.items.map((item) => item.product_name), ['rice', 'paracetamol tablets']);
+  });
+
+  it('extracts plain spoken counts but asks the user to confirm the unit', async () => {
+    const result = await extractVoiceInventory(
+      'Received 20 rice and 5 sugar',
+      'en-US',
+      { apiKey: '' }
+    );
+    assert.deepEqual(result.items.map((item) => item.product_name), ['rice', 'sugar']);
+    assert.deepEqual(result.items.map((item) => item.quantity), [20, 5]);
+    assert.ok(result.items.every((item) => item.warnings.some((warning) => warning.includes('No stock unit'))));
+  });
+
+  it('keeps an expiry date when extracting a count without a unit', async () => {
+    const result = await extractVoiceInventory(
+      'Received 20 rice, expiry December 2027',
+      'en-US',
+      { apiKey: '' }
+    );
+    assert.equal(result.items[0].product_name, 'rice');
+    assert.equal(result.items[0].quantity, 20);
+    assert.equal(result.items[0].expiry_date, '2027-12-31');
+  });
+
   it('flags unsupported offline phrases instead of guessing', async () => {
     const result = await extractVoiceInventory('Maybe add some rice', 'en-US', { apiKey: '' });
     assert.equal(result.items[0].product_name, '');

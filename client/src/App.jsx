@@ -40,6 +40,33 @@ const getErrorMessage = (err) => {
   return err.response?.data?.message || 'Unable to reach the server. Please try again.';
 };
 
+const isValidGtin = (value) => {
+  const digits = String(value || '');
+  if (!/^(?:\d{8}|\d{12,14})$/.test(digits)) return false;
+  const sum = Array.from(digits.slice(0, -1)).reverse().reduce((total, digit, index) =>
+    total + Number(digit) * (index % 2 === 0 ? 3 : 1), 0);
+  return (10 - (sum % 10)) % 10 === Number(digits.slice(-1));
+};
+
+const normalizeCameraBarcode = (value, format) => {
+  const digits = String(value || '');
+  if (format === 'UPC_E' && /^\d{8}$/.test(digits)) {
+    const [numberSystem, ...rest] = digits;
+    const data = rest.slice(0, 6);
+    const checkDigit = rest[6];
+    const expandedBody = data[5] <= '2'
+      ? `${numberSystem}${data.slice(0, 2)}${data[5]}0000${data.slice(2, 5)}`
+      : data[5] === '3'
+        ? `${numberSystem}${data.slice(0, 3)}00000${data.slice(3, 5)}`
+        : data[5] === '4'
+          ? `${numberSystem}${data.slice(0, 4)}00000${data[4]}`
+          : `${numberSystem}${data.slice(0, 5)}0000${data[5]}`;
+    const expanded = `${expandedBody}${checkDigit}`;
+    return isValidGtin(expanded) ? expanded : null;
+  }
+  return isValidGtin(digits) ? digits : null;
+};
+
 // ---------- Auth context ----------
 const AuthContext = createContext(null);
 const useAuth = () => useContext(AuthContext);
@@ -1622,7 +1649,7 @@ function Products() {
     setFile(null);
     setForm(row ? Object.fromEntries(Object.keys(BLANK_PRODUCT).map((k) => [k, row[k] ?? ''])) : { ...BLANK_PRODUCT });
   };
-  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+  const set = (k) => (e) => setForm((current) => ({ ...current, [k]: e.target.value }));
 
   const fillExample = () => {
     const firstCategory = (cats.data || [])[0];
@@ -1778,10 +1805,12 @@ function Products() {
               <div className="col-md-3"><label htmlFor="p-barcode" className="form-label">Barcode</label>
                 <input id="p-barcode" className="form-control" value={form.barcode} onChange={set('barcode')} /></div>
               <div className="col-md-4"><label htmlFor="p-cat" className="form-label">Category *</label>
-                <select id="p-cat" className="form-select" required value={form.category_id} onChange={set('category_id')}>
-                  <option value="">Select...</option>
-                  {(cats.data || []).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                <select id="p-cat" className="form-select" required value={form.category_id} onChange={set('category_id')}
+                  disabled={cats.loading}>
+                  <option value="">{cats.loading ? 'Loading categories...' : 'Select...'}</option>
+                  {(cats.data || []).map((c) => <option key={c.id} value={String(c.id)}>{c.name}</option>)}
                 </select></div>
+              {cats.error && <div className="col-12"><div className="alert alert-danger py-2 mb-0" role="alert">{cats.error}</div></div>}
               <div className="col-md-4"><label htmlFor="p-sup" className="form-label">Supplier</label>
                 <select id="p-sup" className="form-select" value={form.supplier_id} onChange={set('supplier_id')}>
                   <option value="">None</option>
@@ -1953,6 +1982,7 @@ function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
   const [expiryDate, setExpiryDate] = useState('');
   const [productForm, setProductForm] = useState(null);
   const [newCategoryName, setNewCategoryName] = useState('');
+  const [createdCategory, setCreatedCategory] = useState(null);
   const [addingCategory, setAddingCategory] = useState(false);
   const [scanError, setScanError] = useState('');
   const [lookingUp, setLookingUp] = useState(false);
@@ -1960,6 +1990,12 @@ function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraLoading, setCameraLoading] = useState(false);
   const [cameraError, setCameraError] = useState('');
+
+  useEffect(() => {
+    if (createdCategory && categories.data?.some((category) => String(category.id) === String(createdCategory.id))) {
+      setCreatedCategory(null);
+    }
+  }, [categories.data, createdCategory]);
 
   useEffect(() => {
     barcodeRef.current?.focus();
@@ -2031,22 +2067,11 @@ function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
         if (cancelled) return;
         const hints = new Map([
           [DecodeHintType.POSSIBLE_FORMATS, [
-            BarcodeFormat.AZTEC,
-            BarcodeFormat.CODABAR,
-            BarcodeFormat.CODE_39,
-            BarcodeFormat.CODE_93,
-            BarcodeFormat.CODE_128,
-            BarcodeFormat.DATA_MATRIX,
             BarcodeFormat.EAN_8,
             BarcodeFormat.EAN_13,
-            BarcodeFormat.ITF,
-            BarcodeFormat.MAXICODE,
-            BarcodeFormat.PDF_417,
-            BarcodeFormat.QR_CODE,
-            BarcodeFormat.RSS_14,
-            BarcodeFormat.RSS_EXPANDED,
             BarcodeFormat.UPC_A,
             BarcodeFormat.UPC_E,
+            BarcodeFormat.ITF,
           ]],
           [DecodeHintType.TRY_HARDER, true],
         ]);
@@ -2065,12 +2090,17 @@ function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
               scanControls.stop();
               return;
             }
+            const code = normalizeCameraBarcode(result.getText(), result.getBarcodeFormat());
+            if (!code) {
+              setCameraError('The camera read an invalid barcode. Keep it centered and steady, or use a handheld scanner.');
+              return;
+            }
             cameraScanHandledRef.current = true;
             scanControls.stop();
             if (cameraControlsRef.current === scanControls) cameraControlsRef.current = null;
             setCameraActive(false);
             setCameraLoading(false);
-            const code = result.getText();
+            setCameraError('');
             setBarcode(code);
             lookupBarcode(code);
           }
@@ -2156,6 +2186,7 @@ function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
     setAddingCategory(true);
     try {
       const { data } = await api.post('/categories', { name, description: '' });
+      setCreatedCategory({ id: data.id, name });
       setProductForm((current) => ({ ...current, category_id: String(data.id) }));
       setNewCategoryName('');
       categories.reload();
@@ -2294,13 +2325,16 @@ function ReceiveStockModal({ onClose, onDone, canCreateProduct }) {
               <div className="col-md-3">
                 <label htmlFor="receive-new-category" className="form-label">Category *</label>
                 <select id="receive-new-category" className="form-select" required value={productForm.category_id}
-                  onChange={setProductField('category_id')}>
-                  <option value="">Select...</option>
-                  {(categories.data || []).map((category) => (
-                    <option key={category.id} value={category.id}>{category.name}</option>
+                  onChange={setProductField('category_id')} disabled={categories.loading}>
+                  <option value="">{categories.loading ? 'Loading categories...' : 'Select...'}</option>
+                  {[...(categories.data || []), ...(createdCategory && !categories.data?.some(
+                    (category) => String(category.id) === String(createdCategory.id)
+                  ) ? [createdCategory] : [])].map((category) => (
+                    <option key={category.id} value={String(category.id)}>{category.name}</option>
                   ))}
                 </select>
               </div>
+              {categories.error && <div className="col-12"><div className="alert alert-danger py-2 mb-0" role="alert">{categories.error}</div></div>}
               <div className="col-12">
                 <label htmlFor="receive-new-category-name" className="form-label">Or add a category</label>
                 <div className="input-group">

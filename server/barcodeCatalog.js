@@ -1,8 +1,20 @@
 const OPEN_FOOD_FACTS_URL = 'https://world.openfoodfacts.org/api/v2/product/';
 
-const isSupportedBarcode = (barcode) => /^\d{8,14}$/.test(String(barcode || ''));
+function hasValidCheckDigit(barcode) {
+  const digits = String(barcode || '');
+  if (!/^(?:\d{8}|\d{12,14})$/.test(digits)) return false;
+  const body = digits.slice(0, -1);
+  const sum = Array.from(body).reverse().reduce((total, digit, index) =>
+    total + Number(digit) * (index % 2 === 0 ? 3 : 1), 0);
+  return (10 - (sum % 10)) % 10 === Number(digits.at(-1));
+}
+
+const isSupportedBarcode = (barcode) => hasValidCheckDigit(barcode);
 
 async function lookupBarcode(barcode, fetchImpl = fetch) {
+  if (!isSupportedBarcode(barcode)) {
+    throw Object.assign(new Error('Enter a valid product barcode.'), { status: 400 });
+  }
   const url = new URL(`${OPEN_FOOD_FACTS_URL}${encodeURIComponent(barcode)}.json`);
   url.searchParams.set('fields', 'code,product_name,product_name_en,brands,categories');
   const response = await fetchImpl(url, {
@@ -28,4 +40,4 @@ async function lookupBarcode(barcode, fetchImpl = fetch) {
   };
 }
 
-module.exports = { isSupportedBarcode, lookupBarcode };
+module.exports = { hasValidCheckDigit, isSupportedBarcode, lookupBarcode };

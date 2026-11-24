@@ -4,17 +4,17 @@ const { isSupportedBarcode, lookupBarcode } = require('./barcodeCatalog');
 
 describe('barcode catalog lookup', () => {
   it('accepts standard numeric GTIN lengths', () => {
-    for (const barcode of ['12345670', '123456789012', '1234567890123', '12345678901234']) {
+    for (const barcode of ['12345670', '123456789012', '1234567890128', '12345678901231']) {
       assert.equal(isSupportedBarcode(barcode), true);
     }
-    for (const barcode of ['', 'ABC12345', '1234567', '123456789012345']) {
+    for (const barcode of ['', 'ABC12345', '1234567', '1234567890', '123456789012345', '1234567890123']) {
       assert.equal(isSupportedBarcode(barcode), false);
     }
   });
 
   it('normalizes product names, brands, and categories from the catalog response', async () => {
     let requestUrl;
-    const product = await lookupBarcode('1234567890123', async (url, options) => {
+    const product = await lookupBarcode('1234567890128', async (url, options) => {
       requestUrl = url;
       assert.match(options.headers['User-Agent'], /SmartBiz/);
       return {
@@ -39,7 +39,7 @@ describe('barcode catalog lookup', () => {
   });
 
   it('uses the English name when available and handles missing catalog products', async () => {
-    const english = await lookupBarcode('1234567890123', async () => ({
+    const english = await lookupBarcode('1234567890128', async () => ({
       ok: true,
       json: async () => ({
         status: 1,
@@ -48,7 +48,7 @@ describe('barcode catalog lookup', () => {
     }));
     assert.equal(english.name, 'Product name');
 
-    const missing = await lookupBarcode('1234567890123', async () => ({
+    const missing = await lookupBarcode('1234567890128', async () => ({
       ok: true,
       json: async () => ({ status: 0 }),
     }));
@@ -57,8 +57,17 @@ describe('barcode catalog lookup', () => {
 
   it('reports an unavailable catalog instead of returning invented data', async () => {
     await assert.rejects(
-      lookupBarcode('1234567890123', async () => ({ ok: false })),
+      lookupBarcode('1234567890128', async () => ({ ok: false })),
       { status: 502, message: 'The barcode catalog is temporarily unavailable.' }
+    );
+  });
+
+  it('does not send a barcode with an invalid check digit to the catalog', async () => {
+    await assert.rejects(
+      lookupBarcode('1234567890123', async () => {
+        assert.fail('Invalid barcodes must not be looked up.');
+      }),
+      { status: 400, message: 'Enter a valid product barcode.' }
     );
   });
 });

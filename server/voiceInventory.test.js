@@ -63,6 +63,30 @@ describe('voice inventory extraction', () => {
     assert.ok(item.warnings.some((warning) => warning.includes('uncertain')));
   });
 
+  it('matches shuffled product words and selects only a clearly strongest catalog match', () => {
+    const [item] = matchCatalogItems([
+      { product_name: 'biscuits Britannia', brand: '', quantity: 20, expiry_date: null, expiry_text: '', warnings: [] },
+    ], [
+      { id: 1, name: 'Good Day Biscuits', brand: 'Britannia', sku: 'GD-1', current_stock: 4 },
+      { id: 2, name: 'Marie Biscuits', brand: 'Sunrise', sku: 'MB-1', current_stock: 7 },
+    ]);
+    assert.equal(item.candidates[0].id, 1);
+    assert.equal(item.product_id, 1);
+    assert.equal(item.match_confidence, 'high');
+  });
+
+  it('keeps ambiguous token matches unselected', () => {
+    const [item] = matchCatalogItems([
+      { product_name: 'Rice', brand: '', quantity: 20, expiry_date: null, expiry_text: '', warnings: [] },
+    ], [
+      { id: 1, name: 'Basmati Rice', brand: 'Brand A', sku: 'R-1', current_stock: 4 },
+      { id: 2, name: 'Sona Masoori Rice', brand: 'Brand B', sku: 'R-2', current_stock: 7 },
+    ]);
+    assert.equal(item.product_id, null);
+    assert.equal(item.match_confidence, 'low');
+    assert.equal(item.candidates.length, 2);
+  });
+
   it('extracts simple single and multiple receipts offline without an AI key', async () => {
     const single = await extractVoiceInventory(
       'Received 20 packets of Britannia biscuits, expiry December 2027',
@@ -91,6 +115,20 @@ describe('voice inventory extraction', () => {
     );
     assert.deepEqual(result.items.map((item) => item.quantity), [2, 10]);
     assert.deepEqual(result.items.map((item) => item.product_name), ['rice', 'paracetamol tablets']);
+  });
+
+  it('understands product-first and mixed word order in offline voice notes', async () => {
+    const single = await extractVoiceInventory('Rice got 20 packets', 'en-US', { apiKey: '' });
+    assert.equal(single.items[0].product_name, 'Rice');
+    assert.equal(single.items[0].quantity, 20);
+
+    const multiple = await extractVoiceInventory(
+      'Rice 20 packets and sugar 5 bottles received',
+      'en-US',
+      { apiKey: '' }
+    );
+    assert.deepEqual(multiple.items.map((item) => item.product_name), ['Rice', 'sugar']);
+    assert.deepEqual(multiple.items.map((item) => item.quantity), [20, 5]);
   });
 
   it('extracts plain spoken counts but asks the user to confirm the unit', async () => {
